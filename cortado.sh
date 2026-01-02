@@ -4,34 +4,24 @@ set -euo pipefail
 # ==============================================================================
 # cortado.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
 #
-# Installs:
-# - Hyprland stack (Wayland, bar, launcher, notifications, screenshots, clipboard)
-# - PipeWire + WirePlumber (no pipewire-jack to avoid jack2 conflicts)
-# - NetworkManager + Bluetooth
-# - Terminal: Alacritty
-# - Browser: Chromium (+ set default)
-# - Neovim + LazyVim starter
-# - Practical CLI + DevOps tooling (best-effort for repo variance)
+# Adds (as requested):
+# - Start Hyprland via dbus-run-session (avoids Hyprland "started without ... not recommended" warning)
+# - Optional TTY auto-login on tty1 (removes the second password prompt; disk encryption prompt remains)
 #
-# Includes:
-# - Waybar click actions:
-#   - Audio icon -> pavucontrol
-#   - Network icon -> nm-connection-editor
-#   - Bluetooth icon -> blueman-manager
-#
-# Wi-Fi reliability:
-# - Ensures NetworkManager is enabled/started
-# - If offline and nmcli exists, prompts interactively to connect to Wi-Fi
-# - After connection, forces the connection to autoconnect on boot
-# - Also sets all saved Wi-Fi profiles to autoconnect=yes (safe default)
+# Controls (env vars):
+#   ENABLE_AUTOLOGIN=1   # enable auto-login on tty1 for current user (default: 0)
+#   ENABLE_AUTOHYPR=1    # auto-start Hyprland on tty1 login (default: 1)
+#   DETACH_LAZYVIM=1     # remove ~/.config/nvim/.git after cloning (default: 1)
+#   FORCE_NM_DNS=1       # force DNS 1.1.1.1/8.8.8.8 via NetworkManager (default: 0)
 #
 # Usage:
-#   chmod +x cortado.sh
-#   ./cortado.sh
+#   curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/master/cortado.sh | bash -eux
+#   # or locally:
+#   chmod +x cortado.sh && ./cortado.sh
 #
-# Optional env vars:
-#   DETACH_LAZYVIM=1   # remove ~/.config/nvim/.git after cloning (default: 1)
-#   FORCE_NM_DNS=1     # force DNS 1.1.1.1/8.8.8.8 via NetworkManager (default: 0)
+# Notes:
+# - Auto-login affects ONLY the user login prompt. LUKS disk unlock remains.
+# - No display manager assumed/required.
 # ==============================================================================
 
 LOG_PREFIX="[cortado]"
@@ -131,11 +121,8 @@ is_online() {
 # ------------------------------------------------------------------------------
 ensure_wifi_autoconnect() {
   command -v nmcli >/dev/null 2>&1 || return 0
-
-  # Ensure NM is running (no harm if already)
   run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
 
-  # 1) Make *active* Wi-Fi connection autoconnect with higher priority
   local active_wifi_con
   active_wifi_con="$(
     nmcli -t -f NAME,TYPE con show --active 2>/dev/null \
@@ -148,7 +135,6 @@ ensure_wifi_autoconnect() {
     nmcli connection modify "${active_wifi_con}" connection.autoconnect-priority 10 >/dev/null 2>&1 || true
   fi
 
-  # 2) Ensure all saved Wi-Fi connections are set to autoconnect=yes (safe default)
   local wifi_cons
   wifi_cons="$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2=="wifi"{print $1}')"
   if [[ -n "${wifi_cons:-}" ]]; then
@@ -232,7 +218,6 @@ interactive_wifi_connect_if_offline() {
     say "Connect failed (attempt ${attempts}/${max_attempts})."
   done
 
-  # After connection attempts, ensure it will autoconnect on future boots
   ensure_wifi_autoconnect
 
   if is_online; then
@@ -361,15 +346,15 @@ define_packages() {
     playerctl
     polkit-gnome
     qt5-wayland qt6-wayland
+    dbus            # for dbus-run-session Hyprland
   )
 
-  # Audio: PipeWire (no pipewire-jack to avoid jack2 conflicts)
   HW_PKGS=(
     pipewire pipewire-alsa pipewire-pulse
     wireplumber
     pavucontrol
     networkmanager
-    network-manager-applet   # provides nm-connection-editor on Arch
+    network-manager-applet   # provides nm-connection-editor
     bluez bluez-utils
     blueman
   )
@@ -564,6 +549,62 @@ set_default_browser_chromium() {
 }
 
 # ------------------------------------------------------------------------------
+# Hyprland startup fix (no display manager): dbus-run-session + optional autostart
+# ------------------------------------------------------------------------------
+setup_hyprland_startup() {
+  local enable_autohypr="${ENABLE_AUTOHYPR:-1}"
+  [[ "$enable_autohypr" == "1" ]] || { say "Auto-start Hyprland disabled (ENABLE_AUTOHYPR!=1)."; return 0; }
+
+  local profile="${HOME}/.bash_profile"
+  local marker_begin="# >>> cortado hyprland autostart >>>"
+  local marker_end="# <<< cortado hyprland autostart <<<"
+
+  if [[ -f "$profile" ]] && grep -qF "$marker_begin" "$profile"; then
+    say "Hyprland autostart block already present in ~/.bash_profile (skipping)"
+    return 0
+  fi
+
+  say "Adding Hyprland start via dbus-run-session to ~/.bash_profile"
+  cat >>"$profile" <<EOF
+
+${marker_begin}
+# Start Hyprland on TTY1 only, under a D-Bus session (recommended)
+if [[ -z "\$WAYLAND_DISPLAY" && "\${XDG_VTNR:-0}" -eq 1 ]]; then
+  exec dbus-run-session Hyprland
+fi
+${marker_end}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Auto-login on tty1 (optional)
+# ------------------------------------------------------------------------------
+setup_tty_autologin() {
+  local enable="${ENABLE_AUTOLOGIN:-0}"
+  [[ "$enable" == "1" ]] || { say "Auto-login disabled (ENABLE_AUTOLOGIN!=1)."; return 0; }
+
+  local user="${SUDO_USER:-$USER}"
+  [[ -n "${user:-}" ]] || die "Could not determine user for auto-login."
+
+  say "Enabling TTY1 auto-login for user: ${user}"
+
+  run_sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+  local conf="/etc/systemd/system/getty@tty1.service.d/autologin.conf"
+
+  # Idempotent: overwrite with known-good content
+  run_sudo tee "$conf" >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin ${user} --noclear %I \$TERM
+EOF
+
+  # Apply immediately
+  run_sudo systemctl daemon-reexec
+  # restart getty if available; harmless if it fails in some contexts
+  run_sudo systemctl restart getty@tty1 >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
 main() {
@@ -573,15 +614,13 @@ main() {
 
   ensure_network_services
 
-  # If you're offline and nmcli exists, prompt to connect to Wi-Fi.
-  # (If you run from minimal base without NM/nmcli, this is a no-op.)
+  # If offline and nmcli exists, prompt to connect to Wi-Fi.
   interactive_wifi_connect_if_offline
 
   if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
     force_nm_dns
   fi
 
-  # Gate on DNS for common bootstrap hosts
   if ! wait_for_dns github.com 30; then
     force_nm_dns
     wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."
@@ -607,8 +646,6 @@ main() {
   pacman_install_best_effort "${DEVOPS_PKGS[@]}"
 
   enable_services
-
-  # After installing NetworkManager stack, enforce autoconnect again
   ensure_wifi_autoconnect
 
   setup_fuzzel_config
@@ -616,16 +653,15 @@ main() {
   setup_lazyvim
   set_default_browser_chromium
 
+  # Incorporate requested non-DM fixes
+  setup_hyprland_startup
+  setup_tty_autologin
+
   say "Complete."
-  say "Wi-Fi on boot:"
-  say "  - NetworkManager enabled"
-  say "  - Saved Wi-Fi profiles set to autoconnect=yes"
-  say "Waybar click actions:"
-  say "  Audio -> pavucontrol"
-  say "  Network -> nm-connection-editor"
-  say "  Bluetooth -> blueman-manager"
+  say "Hyprland startup: dbus-run-session Hyprland on TTY1 (via ~/.bash_profile) if ENABLE_AUTOHYPR=1"
+  say "Auto-login: ENABLE_AUTOLOGIN=1 will remove the TTY username/password prompt (LUKS prompt remains)"
+  say "Waybar click actions: Audio->pavucontrol, Network->nm-connection-editor, Bluetooth->blueman-manager"
   say "If you were added to the docker group: log out/in to use docker without sudo."
-  say "Run: nvim (to let plugins install)"
 }
 
 main "$@"
