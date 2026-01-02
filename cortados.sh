@@ -13,8 +13,11 @@ set -euo pipefail
 # - Neovim + LazyVim starter
 # - Practical CLI + DevOps tooling (best-effort for repo variance)
 #
-# NEW: Interactive Wi-Fi connect block (runs only if you are offline and have a
-#      Wi-Fi device; uses nmcli; prompts for SSID + password)
+# Includes:
+# - Waybar click actions:
+#   - Audio icon -> pavucontrol
+#   - Network icon -> nm-connection-editor
+#   - Bluetooth icon -> blueman-manager
 #
 # Usage:
 #   chmod +x cortados.sh
@@ -114,7 +117,6 @@ wait_for_http() {
 }
 
 is_online() {
-  # Quick and dependable: IP connectivity + DNS resolution
   ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && getent ahosts github.com >/dev/null 2>&1
 }
 
@@ -129,23 +131,18 @@ interactive_wifi_connect_if_offline() {
     return 0
   fi
 
-  # Prefer ethernet if it is connected (no need to prompt)
   if nmcli -t -f TYPE,STATE dev status 2>/dev/null | grep -q '^ethernet:connected'; then
     say "Ethernet connected but DNS/IP check failed; continuing without Wi-Fi prompt."
     return 0
   fi
 
-  # Find a Wi-Fi device
   local wifi_dev
   wifi_dev="$(nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
   [[ -n "${wifi_dev:-}" ]] || { say "No Wi-Fi device detected; skipping Wi-Fi prompt."; return 0; }
 
-  # Unblock Wi-Fi if rfkill exists
   if command -v rfkill >/dev/null 2>&1; then
     run_sudo rfkill unblock wifi >/dev/null 2>&1 || true
   fi
-
-  # Ensure Wi-Fi radio is on
   nmcli radio wifi on >/dev/null 2>&1 || true
 
   say "Offline detected. Starting interactive Wi-Fi setup (device: ${wifi_dev})."
@@ -165,14 +162,9 @@ interactive_wifi_connect_if_offline() {
       continue
     fi
 
-    # Try to look up SECURITY for that SSID (best effort)
     sec="$(nmcli -t -f SSID,SECURITY dev wifi list ifname "${wifi_dev}" 2>/dev/null | awk -F: -v s="${ssid}" '$1==s{print $2; exit}')"
     sec="${sec:-unknown}"
 
-    # Determine key management
-    # - WPA3 → SAE
-    # - WPA/WPA2 → WPA-PSK
-    # - open → no password
     if [[ "${sec}" == "--" || "${sec}" == "NONE" ]]; then
       say "Detected open network (no password). Connecting..."
       if nmcli dev wifi connect "${ssid}" ifname "${wifi_dev}"; then
@@ -192,13 +184,11 @@ interactive_wifi_connect_if_offline() {
     echo ""
 
     say "Connecting to '${ssid}' (security: ${sec}, key-mgmt: ${km})..."
-    # Use property form (after --) to avoid "invalid extra argument" issues
     if nmcli dev wifi connect "${ssid}" password "${psk}" ifname "${wifi_dev}" -- 802-11-wireless-security.key-mgmt "${km}"; then
       break
     fi
 
     say "Connect failed (attempt ${attempts}/${max_attempts})."
-    say "Tip: if this is WPA3-only and SAE fails, your network may be mixed-mode; try again or use a different AP."
   done
 
   if is_online; then
@@ -206,7 +196,6 @@ interactive_wifi_connect_if_offline() {
     return 0
   fi
 
-  # As a pragmatic fallback for flaky router DNS
   if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
     force_nm_dns
   fi
@@ -336,6 +325,7 @@ define_packages() {
     wireplumber
     pavucontrol
     networkmanager
+    network-manager-applet   # provides nm-connection-editor on Arch
     bluez bluez-utils
     blueman
   )
@@ -421,6 +411,94 @@ radius=8
 EOF
 }
 
+setup_waybar_config() {
+  local dir="${HOME}/.config/waybar"
+  local cfg="${dir}/config.jsonc"
+  local css="${dir}/style.css"
+  mkdir -p "$dir"
+
+  if [[ -f "$cfg" ]]; then
+    say "Waybar config exists: $cfg (skipping)"
+  else
+    say "Writing Waybar config: $cfg"
+    cat >"$cfg" <<'EOF'
+{
+  // Single bar, minimal, with click actions:
+  // - Audio -> pavucontrol
+  // - Network -> nm-connection-editor
+  // - Bluetooth -> blueman-manager
+  "layer": "top",
+  "position": "top",
+  "spacing": 8,
+
+  "modules-left": ["hyprland/workspaces", "hyprland/window"],
+  "modules-center": ["clock"],
+  "modules-right": ["pulseaudio", "network", "bluetooth", "tray"],
+
+  "clock": {
+    "format": "{:%a %d %b  %H:%M}"
+  },
+
+  "pulseaudio": {
+    "format": "{icon} {volume}%",
+    "format-muted": "󰝟 muted",
+    "format-icons": {
+      "default": ["󰕿", "󰖀", "󰕾"]
+    },
+    "on-click": "pavucontrol"
+  },
+
+  "network": {
+    "format-wifi": "󰤨 {signalStrength}%",
+    "format-ethernet": "󰈀",
+    "format-disconnected": "󰤭",
+    "tooltip-format-wifi": "{essid} ({signalStrength}%)",
+    "tooltip-format-ethernet": "{ifname}",
+    "on-click": "nm-connection-editor"
+  },
+
+  "bluetooth": {
+    "format-on": "",
+    "format-off": "",
+    "format-disabled": "",
+    "tooltip-format": "{status}",
+    "on-click": "blueman-manager"
+  }
+}
+EOF
+  fi
+
+  if [[ -f "$css" ]]; then
+    say "Waybar style exists: $css (skipping)"
+  else
+    say "Writing Waybar style: $css"
+    cat >"$css" <<'EOF'
+* {
+  font-family: "Hack Nerd Font", "Hack", monospace;
+  font-size: 12px;
+}
+
+window#waybar {
+  background: rgba(20, 20, 20, 0.85);
+  color: #e6e6e6;
+}
+
+#workspaces button {
+  padding: 0 8px;
+  margin: 4px 2px;
+  border-radius: 8px;
+}
+
+#pulseaudio, #network, #bluetooth, #tray, #clock {
+  padding: 0 10px;
+  margin: 4px 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+}
+EOF
+  fi
+}
+
 setup_lazyvim() {
   need_cmd git
   mkdir -p "${HOME}/.config"
@@ -462,7 +540,7 @@ main() {
     force_nm_dns
   fi
 
-  # Gate on DNS for the two hosts commonly used during bootstrap
+  # Gate on DNS for common bootstrap hosts
   if ! wait_for_dns github.com 30; then
     force_nm_dns
     wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."
@@ -489,10 +567,15 @@ main() {
 
   enable_services
   setup_fuzzel_config
+  setup_waybar_config
   setup_lazyvim
   set_default_browser_chromium
 
   say "Complete."
+  say "Waybar click actions:"
+  say "  Audio -> pavucontrol"
+  say "  Network -> nm-connection-editor"
+  say "  Bluetooth -> blueman-manager"
   say "If you were added to the docker group: log out/in to use docker without sudo."
   say "Run: nvim (to let plugins install)"
 }
