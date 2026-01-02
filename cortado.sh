@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ==============================================================================
+# cortado.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
+#
+# Includes:
+# - Wi-Fi reliability (NetworkManager autoconnect + optional interactive connect)
+# - Waybar click actions (audio/network/bluetooth)
+# - Hyprland startup via dbus-run-session (no display manager)
+# - Optional TTY auto-login
+# - Hyprland default config (bindings + monitor layout) if missing (or forced)
+# - Bluetooth "pairing sticks" fixes:
+#   1) Ensure BlueZ AutoEnable=true (/etc/bluetooth/main.conf.d)
+#   2) Ensure bluetooth service enabled/started
+#   3) Ensure blueman-applet autostarts (provides agent so pairing/connecting persists)
+#
+# Controls (env vars):
+#   ENABLE_AUTOLOGIN=1    # enable auto-login on tty1 for current user (default: 0)
+#   ENABLE_AUTOHYPR=1     # auto-start Hyprland on tty1 login (default: 1)
+#   FORCE_HYPR_CONF=1     # backup+replace ~/.config/hypr/hyprland.conf (default: 0)
+#   FORCE_WAYBAR=1        # backup+replace waybar config/style (default: 0)
+#   DETACH_LAZYVIM=1      # remove ~/.config/nvim/.git after cloning (default: 1)
+#   FORCE_NM_DNS=1        # force DNS 1.1.1.1/8.8.8.8 via NetworkManager (default: 0)
+# ==============================================================================
+
 LOG_PREFIX="[cortado]"
 say() { printf '%s %s\n' "$LOG_PREFIX" "$*"; }
 die() { printf '%s ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
@@ -8,6 +31,9 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 
 run_sudo() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
 
+# ------------------------------------------------------------------------------
+# Detect OS
+# ------------------------------------------------------------------------------
 require_pacman_system() {
   [[ -r /etc/os-release ]] || die "/etc/os-release missing"
   # shellcheck disable=SC1091
@@ -19,7 +45,9 @@ require_pacman_system() {
   need_cmd pacman
 }
 
-# -------------------- Network helpers --------------------
+# ------------------------------------------------------------------------------
+# Network / DNS preflight
+# ------------------------------------------------------------------------------
 ensure_network_services() {
   say "Ensuring network services are available..."
   if systemctl list-unit-files 2>/dev/null | grep -q '^NetworkManager\.service'; then
@@ -73,6 +101,7 @@ is_online() { ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && getent ahosts github.com
 ensure_wifi_autoconnect() {
   command -v nmcli >/dev/null 2>&1 || return 0
   run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
+
   local active_wifi_con
   active_wifi_con="$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
   if [[ -n "${active_wifi_con:-}" ]]; then
@@ -80,21 +109,30 @@ ensure_wifi_autoconnect() {
     nmcli connection modify "${active_wifi_con}" connection.autoconnect yes >/dev/null 2>&1 || true
     nmcli connection modify "${active_wifi_con}" connection.autoconnect-priority 10 >/dev/null 2>&1 || true
   fi
+
   local wifi_cons
   wifi_cons="$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2=="wifi"{print $1}')"
   if [[ -n "${wifi_cons:-}" ]]; then
-    while IFS= read -r c; do [[ -n "$c" ]] && nmcli connection modify "$c" connection.autoconnect yes >/dev/null 2>&1 || true; done <<<"$wifi_cons"
+    while IFS= read -r c; do
+      [[ -n "$c" ]] && nmcli connection modify "$c" connection.autoconnect yes >/dev/null 2>&1 || true
+    done <<<"$wifi_cons"
     say "Ensured autoconnect=yes for saved Wi-Fi profiles."
   fi
 }
 
 interactive_wifi_connect_if_offline() {
   command -v nmcli >/dev/null 2>&1 || return 0
-  if is_online; then say "Network appears online; skipping Wi-Fi prompt."; ensure_wifi_autoconnect; return 0; fi
+  if is_online; then
+    say "Network appears online; skipping Wi-Fi prompt."
+    ensure_wifi_autoconnect
+    return 0
+  fi
+
   if nmcli -t -f TYPE,STATE dev status 2>/dev/null | grep -q '^ethernet:connected'; then
     say "Ethernet connected but DNS/IP check failed; continuing without Wi-Fi prompt."
     return 0
   fi
+
   local wifi_dev
   wifi_dev="$(nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
   [[ -n "${wifi_dev:-}" ]] || { say "No Wi-Fi device detected; skipping Wi-Fi prompt."; return 0; }
@@ -110,13 +148,19 @@ interactive_wifi_connect_if_offline() {
     attempts=$((attempts+1))
     local ssid sec km psk
     read -r -p "Enter SSID (Wi-Fi name). Leave empty to re-list: " ssid
-    if [[ -z "${ssid}" ]]; then nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true; continue; fi
+    if [[ -z "${ssid}" ]]; then
+      nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true
+      continue
+    fi
+
     sec="$(nmcli -t -f SSID,SECURITY dev wifi list ifname "${wifi_dev}" 2>/dev/null | awk -F: -v s="${ssid}" '$1==s{print $2; exit}')"
     sec="${sec:-unknown}"
+
     if [[ "${sec}" == "--" || "${sec}" == "NONE" ]]; then
       say "Open network. Connecting..."
       nmcli dev wifi connect "${ssid}" ifname "${wifi_dev}" && break || { say "Connect failed."; continue; }
     fi
+
     echo "${sec}" | grep -qi 'WPA3' && km="sae" || km="wpa-psk"
     read -r -s -p "Enter Wi-Fi password for '${ssid}': " psk; echo ""
     say "Connecting to '${ssid}' (key-mgmt: ${km})..."
@@ -127,17 +171,23 @@ interactive_wifi_connect_if_offline() {
   ensure_wifi_autoconnect
   is_online && { say "Online confirmed."; return 0; }
 
-  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then force_nm_dns; is_online && { say "Online confirmed after DNS override."; return 0; }; fi
+  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
+    force_nm_dns
+    is_online && { say "Online confirmed after DNS override."; return 0; }
+  fi
+
   die "Still offline after Wi-Fi attempts. Connect to a network, then rerun this script."
 }
 
-# -------------------- Pacman helpers --------------------
+# ------------------------------------------------------------------------------
+# Pacman
+# ------------------------------------------------------------------------------
 pacman_bootstrap() {
   say "Refreshing keyring + syncing databases…"
   run_sudo pacman -Sy --noconfirm archlinux-keyring >/dev/null 2>&1 || true
   run_sudo pacman -Syyu --noconfirm || true
 }
-pacman_install_strict() { say "Installing (strict): $*"; run_sudo pacman -S --noconfirm --needed "$@"; }
+pacman_install_strict() { run_sudo pacman -S --noconfirm --needed "$@"; }
 pacman_install_best_effort() {
   local ok=() missing=()
   for p in "$@"; do pacman -Si "$p" >/dev/null 2>&1 && ok+=("$p") || missing+=("$p"); done
@@ -161,6 +211,9 @@ git_clone_retry() {
   done
 }
 
+# ------------------------------------------------------------------------------
+# Package sets
+# ------------------------------------------------------------------------------
 define_packages() {
   BASE_PKGS=(base-devel git curl wget ca-certificates unzip zip gnupg openssh rsync jq yq ripgrep fd fzf bat eza btop htop tmux neovim shellcheck shfmt tree)
   WAYLAND_PKGS=(hyprland xdg-desktop-portal xdg-desktop-portal-hyprland waybar mako fuzzel wl-clipboard grim slurp swappy brightnessctl playerctl polkit-gnome qt5-wayland qt6-wayland dbus)
@@ -172,13 +225,16 @@ define_packages() {
   EXTRAS_PKGS=(less man-db man-pages inetutils bind traceroute openssl)
 }
 
+# ------------------------------------------------------------------------------
+# Services and Bluetooth fixes
+# ------------------------------------------------------------------------------
 enable_services() {
   say "Enabling core services…"
   run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
   run_sudo systemctl enable --now bluetooth >/dev/null 2>&1 || true
+
   if systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
     run_sudo systemctl enable --now docker >/dev/null 2>&1 || true
-    getent group docker >/dev/null 2>&1 || true
     if getent group docker >/dev/null 2>&1; then
       if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
         say "Adding user '$USER' to docker group (logout/login required)"
@@ -188,6 +244,20 @@ enable_services() {
   fi
 }
 
+setup_bluez_autenable() {
+  # Non-destructive: drop-in rather than overwriting /etc/bluetooth/main.conf
+  say "Configuring BlueZ AutoEnable (drop-in)"
+  run_sudo mkdir -p /etc/bluetooth/main.conf.d
+  run_sudo tee /etc/bluetooth/main.conf.d/10-cortado.conf >/dev/null <<'EOF'
+[General]
+AutoEnable=true
+EOF
+  run_sudo systemctl restart bluetooth >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------------------
+# Configs
+# ------------------------------------------------------------------------------
 setup_fuzzel_config() {
   local dir="${HOME}/.config/fuzzel" cfg="${dir}/fuzzel.ini"
   mkdir -p "$dir"
@@ -206,9 +276,22 @@ EOF
 }
 
 setup_waybar_config() {
-  local dir="${HOME}/.config/waybar" cfg="${dir}/config.jsonc" css="${dir}/style.css"
+  local dir="${HOME}/.config/waybar"
+  local cfg="${dir}/config.jsonc"
+  local css="${dir}/style.css"
+  local force="${FORCE_WAYBAR:-0}"
   mkdir -p "$dir"
-  [[ -f "$cfg" ]] || cat >"$cfg" <<'EOF'
+
+  if [[ -f "$cfg" && "$force" == "1" ]]; then
+    cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  if [[ -f "$css" && "$force" == "1" ]]; then
+    cp -a "$css" "${css}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+
+  if [[ ! -f "$cfg" || "$force" == "1" ]]; then
+    say "Writing Waybar config: $cfg"
+    cat >"$cfg" <<'EOF'
 {
   "layer": "top",
   "position": "top",
@@ -245,7 +328,13 @@ setup_waybar_config() {
   }
 }
 EOF
-  [[ -f "$css" ]] || cat >"$css" <<'EOF'
+  else
+    say "Waybar config exists: $cfg (skipping). Set FORCE_WAYBAR=1 to replace."
+  fi
+
+  if [[ ! -f "$css" || "$force" == "1" ]]; then
+    say "Writing Waybar style: $css"
+    cat >"$css" <<'EOF'
 * { font-family: "Hack Nerd Font", "Hack", monospace; font-size: 12px; }
 window#waybar { background: rgba(20, 20, 20, 0.85); color: #e6e6e6; }
 #workspaces button { padding: 0 8px; margin: 4px 2px; border-radius: 8px; }
@@ -254,6 +343,9 @@ window#waybar { background: rgba(20, 20, 20, 0.85); color: #e6e6e6; }
   background: rgba(255, 255, 255, 0.06);
 }
 EOF
+  else
+    say "Waybar style exists: $css (skipping). Set FORCE_WAYBAR=1 to replace."
+  fi
 }
 
 setup_lazyvim() {
@@ -271,12 +363,16 @@ set_default_browser_chromium() {
   }
 }
 
+# ------------------------------------------------------------------------------
+# Hyprland startup fix (no display manager) + optional autologin
+# ------------------------------------------------------------------------------
 setup_hyprland_startup() {
-  local profile="${HOME}/.bash_profile"
-  local marker_begin="# >>> cortado hyprland autostart >>>"
   [[ "${ENABLE_AUTOHYPR:-1}" == "1" ]] || { say "Hyprland autostart disabled (ENABLE_AUTOHYPR!=1)."; return 0; }
-  [[ -f "$profile" && "$(grep -cF "$marker_begin" "$profile" || true)" -gt 0 ]] && { say "Hyprland autostart already set (skip)"; return 0; }
+  local profile="${HOME}/.bash_profile"
+  local marker="# >>> cortado hyprland autostart >>>"
+  [[ -f "$profile" && "$(grep -cF "$marker" "$profile" || true)" -gt 0 ]] && { say "Hyprland autostart already set (skip)"; return 0; }
 
+  say "Adding Hyprland start via dbus-run-session to ~/.bash_profile"
   cat >>"$profile" <<'EOF'
 
 # >>> cortado hyprland autostart >>>
@@ -292,6 +388,7 @@ setup_tty_autologin() {
   [[ "${ENABLE_AUTOLOGIN:-0}" == "1" ]] || { say "Auto-login disabled (ENABLE_AUTOLOGIN!=1)."; return 0; }
   local user="${SUDO_USER:-$USER}"
   [[ -n "${user:-}" ]] || die "Could not determine user for auto-login."
+  say "Enabling TTY1 auto-login for user: ${user}"
   run_sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
   run_sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
 [Service]
@@ -302,12 +399,13 @@ EOF
   run_sudo systemctl restart getty@tty1 >/dev/null 2>&1 || true
 }
 
-# -------------------- Hyprland config (bindings + monitors) --------------------
+# ------------------------------------------------------------------------------
+# Hyprland config (bindings + monitor layout + blueman-applet autostart)
+# ------------------------------------------------------------------------------
 setup_hyprland_conf() {
   local dir="${HOME}/.config/hypr"
   local conf="${dir}/hyprland.conf"
   local force="${FORCE_HYPR_CONF:-0}"
-
   mkdir -p "$dir"
 
   if [[ -f "$conf" && "$force" != "1" ]]; then
@@ -324,13 +422,9 @@ setup_hyprland_conf() {
   say "Writing Hyprland config: $conf"
   cat >"$conf" <<'EOF'
 # Hyprland config generated by cortado.sh
-# Monitor layout:
-# - External ultrawide (DP-1) 3440x1440 as main at 0x0
+# Monitor layout (edit connector names after `hyprctl monitors` if needed):
+# - External ultrawide (DP-1) 3440x1440 at 0x0
 # - Laptop (eDP-1) to the right at 3440x0
-#
-# If your connector names differ, run:
-#   hyprctl monitors
-# and replace DP-1 / eDP-1 below.
 
 $mod = SUPER
 $term = alacritty
@@ -359,14 +453,10 @@ general {
 
 decoration {
   rounding = 10
-  blur {
-    enabled = false
-  }
+  blur { enabled = false }
 }
 
-animations {
-  enabled = false
-}
+animations { enabled = false }
 
 misc {
   disable_hyprland_logo = true
@@ -376,19 +466,17 @@ misc {
 # ---------- Autostart ----------
 exec-once = waybar
 exec-once = mako
+exec-once = blueman-applet
 exec-once = /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
 
 # ---------- Keybindings ----------
-# Launcher / apps
 bind = $mod, RETURN, exec, $term
 bind = $mod, D, exec, $menu
 bind = $mod, B, exec, $browser
 
-# Close / quit
 bind = $mod, Q, killactive
 bind = $mod SHIFT, Q, exit
 
-# Floating / fullscreen
 bind = $mod, F, fullscreen
 bind = $mod, SPACE, togglefloating
 bind = $mod, P, pseudo
@@ -444,6 +532,9 @@ bindm = $mod, mouse:273, resizewindow
 EOF
 }
 
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 main() {
   require_pacman_system
   need_cmd systemctl
@@ -452,7 +543,7 @@ main() {
   ensure_network_services
   interactive_wifi_connect_if_offline
 
-  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then force_nm_dns; fi
+  [[ "${FORCE_NM_DNS:-0}" == "1" ]] && force_nm_dns || true
 
   wait_for_dns github.com 30 || { force_nm_dns; wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."; }
   wait_for_dns raw.githubusercontent.com 30 || { force_nm_dns; wait_for_dns raw.githubusercontent.com 60 || die "DNS not working; connect to network and retry."; }
@@ -461,6 +552,7 @@ main() {
   pacman_bootstrap
   define_packages
 
+  say "Installing packages…"
   pacman_install_strict \
     "${BASE_PKGS[@]}" \
     "${WAYLAND_PKGS[@]}" \
@@ -475,6 +567,9 @@ main() {
   enable_services
   ensure_wifi_autoconnect
 
+  # Bluetooth pairing-stick fixes (all three)
+  setup_bluez_autenable
+
   setup_fuzzel_config
   setup_waybar_config
   setup_lazyvim
@@ -482,13 +577,12 @@ main() {
 
   setup_hyprland_startup
   setup_tty_autologin
-
-  # NEW: Hyprland bindings + monitor layout
   setup_hyprland_conf
 
   say "Complete."
-  say "Hyprland config: ~/.config/hypr/hyprland.conf"
-  say "If you already had one, it was skipped unless FORCE_HYPR_CONF=1"
+  say "Bluetooth fixes applied: AutoEnable=true drop-in + bluetooth enabled + blueman-applet autostart (if Hypr config written)."
+  say "If you want Hypr config overwritten on existing systems: FORCE_HYPR_CONF=1"
+  say "If you want Waybar config overwritten on existing systems: FORCE_WAYBAR=1"
 }
 
 main "$@"
