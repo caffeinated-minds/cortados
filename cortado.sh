@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ==============================================================================
-# cortados.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
+# cortado.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
 #
 # Installs:
 # - Hyprland stack (Wayland, bar, launcher, notifications, screenshots, clipboard)
@@ -19,16 +19,22 @@ set -euo pipefail
 #   - Network icon -> nm-connection-editor
 #   - Bluetooth icon -> blueman-manager
 #
+# Wi-Fi reliability:
+# - Ensures NetworkManager is enabled/started
+# - If offline and nmcli exists, prompts interactively to connect to Wi-Fi
+# - After connection, forces the connection to autoconnect on boot
+# - Also sets all saved Wi-Fi profiles to autoconnect=yes (safe default)
+#
 # Usage:
-#   chmod +x cortados.sh
-#   ./cortados.sh
+#   chmod +x cortado.sh
+#   ./cortado.sh
 #
 # Optional env vars:
 #   DETACH_LAZYVIM=1   # remove ~/.config/nvim/.git after cloning (default: 1)
 #   FORCE_NM_DNS=1     # force DNS 1.1.1.1/8.8.8.8 via NetworkManager (default: 0)
 # ==============================================================================
 
-LOG_PREFIX="[cortados]"
+LOG_PREFIX="[cortado]"
 say() { printf '%s %s\n' "$LOG_PREFIX" "$*"; }
 die() { printf '%s ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
@@ -121,6 +127,40 @@ is_online() {
 }
 
 # ------------------------------------------------------------------------------
+# Wi-Fi: ensure saved connections autoconnect (so reboot comes online)
+# ------------------------------------------------------------------------------
+ensure_wifi_autoconnect() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+
+  # Ensure NM is running (no harm if already)
+  run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
+
+  # 1) Make *active* Wi-Fi connection autoconnect with higher priority
+  local active_wifi_con
+  active_wifi_con="$(
+    nmcli -t -f NAME,TYPE con show --active 2>/dev/null \
+      | awk -F: '$2=="wifi"{print $1; exit}'
+  )"
+
+  if [[ -n "${active_wifi_con:-}" ]]; then
+    say "Setting autoconnect for active Wi-Fi connection: ${active_wifi_con}"
+    nmcli connection modify "${active_wifi_con}" connection.autoconnect yes >/dev/null 2>&1 || true
+    nmcli connection modify "${active_wifi_con}" connection.autoconnect-priority 10 >/dev/null 2>&1 || true
+  fi
+
+  # 2) Ensure all saved Wi-Fi connections are set to autoconnect=yes (safe default)
+  local wifi_cons
+  wifi_cons="$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2=="wifi"{print $1}')"
+  if [[ -n "${wifi_cons:-}" ]]; then
+    while IFS= read -r c; do
+      [[ -n "$c" ]] || continue
+      nmcli connection modify "$c" connection.autoconnect yes >/dev/null 2>&1 || true
+    done <<<"$wifi_cons"
+    say "Ensured autoconnect=yes for saved Wi-Fi profiles."
+  fi
+}
+
+# ------------------------------------------------------------------------------
 # Interactive Wi-Fi connect (nmcli)
 # ------------------------------------------------------------------------------
 interactive_wifi_connect_if_offline() {
@@ -128,6 +168,7 @@ interactive_wifi_connect_if_offline() {
 
   if is_online; then
     say "Network appears online; skipping Wi-Fi prompt."
+    ensure_wifi_autoconnect
     return 0
   fi
 
@@ -190,6 +231,9 @@ interactive_wifi_connect_if_offline() {
 
     say "Connect failed (attempt ${attempts}/${max_attempts})."
   done
+
+  # After connection attempts, ensure it will autoconnect on future boots
+  ensure_wifi_autoconnect
 
   if is_online; then
     say "Online confirmed."
@@ -423,10 +467,6 @@ setup_waybar_config() {
     say "Writing Waybar config: $cfg"
     cat >"$cfg" <<'EOF'
 {
-  // Single bar, minimal, with click actions:
-  // - Audio -> pavucontrol
-  // - Network -> nm-connection-editor
-  // - Bluetooth -> blueman-manager
   "layer": "top",
   "position": "top",
   "spacing": 8,
@@ -533,7 +573,8 @@ main() {
 
   ensure_network_services
 
-  # If you're offline, prompt to connect to Wi-Fi before doing anything else.
+  # If you're offline and nmcli exists, prompt to connect to Wi-Fi.
+  # (If you run from minimal base without NM/nmcli, this is a no-op.)
   interactive_wifi_connect_if_offline
 
   if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
@@ -566,12 +607,19 @@ main() {
   pacman_install_best_effort "${DEVOPS_PKGS[@]}"
 
   enable_services
+
+  # After installing NetworkManager stack, enforce autoconnect again
+  ensure_wifi_autoconnect
+
   setup_fuzzel_config
   setup_waybar_config
   setup_lazyvim
   set_default_browser_chromium
 
   say "Complete."
+  say "Wi-Fi on boot:"
+  say "  - NetworkManager enabled"
+  say "  - Saved Wi-Fi profiles set to autoconnect=yes"
   say "Waybar click actions:"
   say "  Audio -> pavucontrol"
   say "  Network -> nm-connection-editor"
