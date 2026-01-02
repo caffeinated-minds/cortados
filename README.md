@@ -62,6 +62,6 @@ Before running the script, you must have:
 After logging into your freshly installed Arch system:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<your-username>/cortados/main/cortados.sh | bash
+curl -fsSL https://raw.githubusercontent.com/caffeinated-minds/cortados/main/cortados.sh | bash
 ```
 
