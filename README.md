@@ -1,67 +1,68 @@
-# Cortados
+# cortados
 
-Opinionated post-install bootstrap script for **Arch Linux**.
+A **minimal, reproducible Arch Linux workstation bootstrap** inspired by Omarchy.
 
-This repository contains a single script that turns a minimal Arch base install into a
-keyboard-driven **Hyprland** workstation with an **Omarchy-inspired** workflow.
+The goal is a **boring, predictable, keyboard-driven system**:
+- Wayland + tiling compositor (Hyprland)
+- Repo-only packages (no AUR, no Flatpak)
+- PipeWire audio (no JACK conflicts)
+- Terminal-centric workflow
+- Safe to re-run
 
-The goal is:
-
-- predictable
-- reproducible
-- minimal
-- boring (in a good way)
-
-No display manager. No desktop environment. No hidden magic.
+This repository provides a single script: **`cortados.sh`**.
 
 ---
 
-## What This Does
+## What this sets up
 
-After a clean Arch install, the script installs and configures:
-
+### Core system
 - Hyprland (Wayland compositor)
-- Waybar, mako, walker
-- PipeWire + WirePlumber (audio works out of the box)
-- iwd (networking, unchanged from base install)
-- XDG portals (screensharing, file pickers, desktop integration)
-- Omarchy-derived Catppuccin theme assets
-- Keyboard-driven workflow and locked keybindings
-- Docker and common developer tooling
-- Sensible laptop defaults (power profiles, zram, brightness)
+- Waybar (status bar)
+- Fuzzel (launcher)
+- Mako (notifications)
+- PipeWire + WirePlumber (audio)
+- NetworkManager + Bluetooth
+- Clipboard, screenshots, brightness, media keys
 
-Hyprland is launched directly from TTY using `dbus-run-session`.
-No display manager is used.
+### Applications
+- **Terminal**: Alacritty
+- **Browser**: Chromium (default browser set)
+- **Editor**: Neovim + LazyVim starter
+- Fonts: Hack Nerd Font, Noto (+ emoji)
 
----
+### CLI / DevOps tooling (best-effort)
+Installed only if present in your repos:
+- terraform, terragrunt
+- kubectl, helm, k9s, kustomize
+- docker, docker-compose
+- aws-cli, azure-cli
+- go, nodejs, python
+- jq, yq, ripgrep, fd, fzf, etc.
 
-## What This Does _Not_ Do
-
-- It does **not** install Arch Linux
-- It does **not** manage disks or bootloaders
-- It does **not** install a desktop environment
-- It does **not** manage personal dotfiles beyond what is required to function
-
-Arch installation is expected to be done first (manually or via `archinstall`).
-
----
-
-## Requirements
-
-Before running the script, you must have:
-
-- A working Arch Linux base install
-- A normal user with `sudo` access
-- Network connectivity (wired or via iwd)
-- `curl` and `git` available (usually present on base installs)
+Missing tools are **skipped**, not fatal.
 
 ---
 
-## Usage
+## Design principles
 
-After logging into your freshly installed Arch system:
+- **No AUR**
+- **No Flatpak**
+- **No interactive pacman conflicts**
+- **Idempotent**: safe to re-run
+- Explicit DNS checks before network operations
+- Minimal assumptions about the base system
+
+---
+
+## Supported installation methods
+
+### Recommended (most reproducible)
+
+Clone the repo and run locally:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/caffeinated-minds/cortados/master/cortados.sh | bash
-```
-
+sudo pacman -S --noconfirm git
+git clone https://github.com/<your-username>/cortados.git
+cd cortados
+chmod +x cortados.sh
+./cortados.sh
