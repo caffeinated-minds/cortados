@@ -1,619 +1,500 @@
 #!/usr/bin/env bash
-# cortados.sh — Arch → Hyprland workstation (Omarchy-like), performance-first, reproducible
 set -euo pipefail
 
-# ----------------------------
-# User-tunable knobs
-# ----------------------------
-OMARCHY_TAG="${OMARCHY_TAG:-v3.2.3}"      # pin Omarchy theme assets
-THEME_NAME="${THEME_NAME:-catppuccin}"    # Omarchy theme folder name
-ENABLE_BLUETOOTH="${ENABLE_BLUETOOTH:-1}" # 1=install+enable bluetooth stack
-ENABLE_T2="${ENABLE_T2:-0}"               # 1=install T2 Mac packages (only if you know you need them)
-INSTALL_LAZYVIM="${INSTALL_LAZYVIM:-1}"   # 1=install LazyVim starter
+# ==============================================================================
+# cortados.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
+#
+# Installs:
+# - Hyprland stack (Wayland, bar, launcher, notifications, screenshots, clipboard)
+# - PipeWire + WirePlumber (no pipewire-jack to avoid jack2 conflicts)
+# - NetworkManager + Bluetooth
+# - Terminal: Alacritty
+# - Browser: Chromium (+ set default)
+# - Neovim + LazyVim starter
+# - Practical CLI + DevOps tooling (best-effort for repo variance)
+#
+# NEW: Interactive Wi-Fi connect block (runs only if you are offline and have a
+#      Wi-Fi device; uses nmcli; prompts for SSID + password)
+#
+# Usage:
+#   chmod +x cortados.sh
+#   ./cortados.sh
+#
+# Optional env vars:
+#   DETACH_LAZYVIM=1   # remove ~/.config/nvim/.git after cloning (default: 1)
+#   FORCE_NM_DNS=1     # force DNS 1.1.1.1/8.8.8.8 via NetworkManager (default: 0)
+# ==============================================================================
 
-# ----------------------------
-# Logging helpers
-# ----------------------------
-log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
-warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
-die() {
-  printf "\033[1;31m[x] %s\033[0m\n" "$*"
-  exit 1
-}
-
+LOG_PREFIX="[cortados]"
+say() { printf '%s %s\n' "$LOG_PREFIX" "$*"; }
+die() { printf '%s ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
-# ----------------------------
-# Preflight
-# ----------------------------
-preflight() {
-  need_cmd pacman
-  need_cmd sudo
-  need_cmd systemctl
-
-  if [[ "$(id -u)" -eq 0 ]]; then
-    die "Run as a normal user with sudo, not as root."
-  fi
-
-  log "Refreshing pacman database"
-  sudo pacman -Syu --noconfirm
-
-  log "Ensuring build + download essentials"
-  sudo pacman -S --needed --noconfirm base-devel git curl tar
-
-  need_cmd curl
-  need_cmd git
+run_sudo() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then sudo "$@"; else "$@"; fi
 }
 
-# ----------------------------
-# Package classification helpers
-# ----------------------------
-pacman_has_pkg() { pacman -Si "$1" >/dev/null 2>&1; }
-
-install_pacman() {
-  local -a pkgs=("$@")
-  ((${#pkgs[@]})) || return 0
-  log "Installing (pacman): ${#pkgs[@]} packages"
-  sudo pacman -S --needed --noconfirm "${pkgs[@]}"
-}
-
-ensure_yay() {
-  command -v yay >/dev/null 2>&1 && return 0
-
-  # If yay exists in repos (rare), use it
-  if pacman_has_pkg yay; then
-    log "Installing yay via pacman"
-    sudo pacman -S --needed --noconfirm yay
-    return 0
-  fi
-
-  # Prefer yay-bin from AUR (prebuilt) to avoid source tarball builds
-  log "Bootstrapping yay-bin from AUR"
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
-
-  # Clone the AUR PKGBUILD for yay-bin (not GitHub source)
-  git clone https://aur.archlinux.org/yay-bin.git "$tmpdir/yay-bin"
-  (cd "$tmpdir/yay-bin" && makepkg -si --noconfirm)
-}
-
-install_aur() {
-  local -a pkgs=("$@")
-  ((${#pkgs[@]})) || return 0
-  ensure_yay
-  log "Installing (AUR): ${#pkgs[@]} packages"
-  yay -S --needed --noconfirm "${pkgs[@]}"
-}
-
-# ----------------------------
-# Hardware detection
-# ----------------------------
-detect_gpu() {
-  # Requires pciutils (lspci)
-  local out
-  out="$(lspci -nn | tr '[:upper:]' '[:lower:]' || true)"
-  if echo "$out" | grep -q "nvidia"; then
-    echo "nvidia"
-    return
-  fi
-  if echo "$out" | grep -q "intel"; then
-    echo "intel"
-    return
-  fi
-  if echo "$out" | grep -q -E "amd|advanced micro devices|ati"; then
-    echo "amd"
-    return
-  fi
-  echo "unknown"
-}
-
-detect_broadcom_wifi() {
-  # Broadcom vendor id commonly 14e4
-  local out
-  out="$(lspci -nn | tr '[:upper:]' '[:lower:]' || true)"
-  echo "$out" | grep -qE "network controller|wireless" && echo "$out" | grep -q "14e4"
-}
-
-# ----------------------------
-# Phase 1 packages (FROZEN, updated)
-# ----------------------------
-phase1_packages() {
-  local -a pkgs=(
-    # Absolute base + essentials for script and detection
-    base linux linux-firmware linux-headers
-    git wget curl unzip man-db less bash-completion
-    pciutils
-
-    # Wayland + Hyprland
-    hyprland hypridle hyprlock hyprpicker hyprsunset
-    xdg-desktop-portal xdg-desktop-portal-hyprland xdg-desktop-portal-gtk
-    qt5-wayland qt6-wayland egl-wayland
-    grim slurp wl-clipboard
-
-    # Bar/notifications
-    waybar mako swaybg swayosd
-
-    # Audio
-    pipewire pipewire-alsa pipewire-pulse wireplumber gst-plugin-pipewire pamixer playerctl
-
-    # Networking
-    iwd avahi nss-mdns
-
-    # Fonts
-    noto-fonts noto-fonts-emoji ttf-hack-nerd
-
-    # Session/permissions
-    polkit-gnome uwsm
-  )
-  printf "%s\n" "${pkgs[@]}"
-}
-
-# ----------------------------
-# Phase 2 packages (FROZEN, printing enabled, bluetui included)
-# ----------------------------
-phase2_packages() {
-  local gpu="$1"
-  local -a pkgs=(
-    # Laptop responsiveness defaults
-    power-profiles-daemon zram-generator brightnessctl
-
-    # Printing (enabled out-of-box)
-    cups cups-filters cups-browsed cups-pdf system-config-printer
-  )
-
-  case "$gpu" in
-  nvidia) pkgs+=(nvidia-open-dkms nvidia-utils lib32-nvidia-utils egl-wayland) ;;
-  intel) pkgs+=(libva-intel-driver) ;;
-  amd) ;;
-  *) ;;
+# ------------------------------------------------------------------------------
+# Detect OS
+# ------------------------------------------------------------------------------
+require_pacman_system() {
+  [[ -r /etc/os-release ]] || die "/etc/os-release missing"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  case "${ID:-}" in
+    arch|endeavouros|manjaro|garuda|artix|arcolinux|cachyos|omarchy) : ;;
+    *) die "This script is for pacman-based systems. Detected ID=${ID:-unknown}" ;;
   esac
-
-  if detect_broadcom_wifi; then
-    pkgs+=(broadcom-wl dkms)
-  fi
-
-  if [[ "$ENABLE_BLUETOOTH" == "1" ]]; then
-    pkgs+=(bluez bluez-utils bluetui)
-  fi
-
-  if [[ "$ENABLE_T2" == "1" ]]; then
-    pkgs+=(linux-t2 linux-t2-headers apple-bcm-firmware apple-t2-audio-config t2fanrd tiny-dfr)
-  fi
-
-  printf "%s\n" "${pkgs[@]}"
+  need_cmd pacman
 }
 
-# ----------------------------
-# Phase 3 packages (FROZEN + brave/alacritty/tmux + docker)
-# ----------------------------
-phase3_packages() {
-  local -a pkgs=(
-    # Containers
-    docker docker-buildx docker-compose
+# ------------------------------------------------------------------------------
+# Network / DNS preflight
+# ------------------------------------------------------------------------------
+ensure_network_services() {
+  say "Ensuring network services are available..."
 
-    # Dev toolchains
-    clang llvm cmake ninja pkgconf
-    go
-    nodejs npm corepack
-    python python-pip python-virtualenv
-    lua luarocks
-
-    # GUI productivity
-    localsend xournalpp pinta
-
-    # Media & creative
-    mpv gpu-screen-recorder satty imv
-
-    # CLI QoL
-    bat eza btop fastfetch dust lazygit lazydocker tldr zoxide starship
-
-    # Neovim
-    neovim
-
-    # Terminal & multiplexer
-    alacritty tmux
-  )
-  printf "%s\n" "${pkgs[@]}"
-}
-
-phase3_aur_packages() {
-  local -a aur_pkgs=(
-    brave-bin
-    walker-bin
-  )
-  printf "%s\n" "${aur_pkgs[@]}"
-}
-
-# ----------------------------
-# Service enablement
-# ----------------------------
-enable_services() {
-  log "Enabling iwd and Avahi"
-  sudo systemctl enable --now iwd.service
-  sudo systemctl enable --now avahi-daemon.service
-
-  log "Enabling printing via socket activation (cups.socket)"
-  sudo systemctl enable --now cups.socket
-
-  log "Enabling power-profiles-daemon"
-  sudo systemctl enable --now power-profiles-daemon.service
-
-  if [[ "$ENABLE_BLUETOOTH" == "1" ]]; then
-    log "Enabling Bluetooth"
-    sudo systemctl enable --now bluetooth.service
+  if systemctl list-unit-files 2>/dev/null | grep -q '^NetworkManager\.service'; then
+    run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
   fi
 
-  log "Enabling Docker"
-  sudo systemctl enable --now docker.service
-  if ! id -nG "$USER" | grep -qw docker; then
-    log "Adding user '$USER' to docker group"
-    sudo usermod -aG docker "$USER"
-    warn "Log out/in (or reboot) for docker group membership to apply."
-  fi
-}
-
-# ----------------------------
-# ZRAM setup
-# ----------------------------
-configure_zram() {
-  log "Configuring zram-generator"
-  sudo mkdir -p /etc/systemd
-  sudo tee /etc/systemd/zram-generator.conf >/dev/null <<'EOF'
-[zram0]
-zram-size = min(ram / 2, 4096)
-compression-algorithm = zstd
-swap-priority = 100
-EOF
-
-  sudo systemctl daemon-reload
-  sudo systemctl restart systemd-zram-setup@zram0.service >/dev/null 2>&1 || true
-}
-
-# ----------------------------
-# TTY -> Hyprland autostart (no display manager)
-# ----------------------------
-configure_tty_autostart() {
-  log "Configuring TTY autostart for Hyprland on tty1 (dbus-run-session)"
-
-  local profile="$HOME/.bash_profile"
-  [[ -f "$HOME/.zprofile" ]] && profile="$HOME/.zprofile"
-
-  if ! grep -q "cortados-autostart-hyprland" "$profile" 2>/dev/null; then
-    cat >>"$profile" <<'EOF'
-
-# cortados-autostart-hyprland
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "${XDG_VTNR:-}" = "1" ]; then
-  exec dbus-run-session Hyprland
-fi
-EOF
-  fi
-}
-
-# ----------------------------
-# LazyVim upstream bootstrap + Catppuccin Mocha
-# ----------------------------
-install_lazyvim() {
-  [[ "$INSTALL_LAZYVIM" == "1" ]] || return 0
-
-  log "Installing LazyVim (upstream starter) + Catppuccin Mocha"
-
-  local nvim_dir="$HOME/.config/nvim"
-  if [[ -d "$nvim_dir" && ! -d "$nvim_dir/.git" ]]; then
-    warn "~/.config/nvim exists and is not a git repo; backing up to ~/.config/nvim.bak"
-    rm -rf "$HOME/.config/nvim.bak" || true
-    mv "$nvim_dir" "$HOME/.config/nvim.bak"
-  fi
-
-  if [[ ! -d "$nvim_dir" ]]; then
-    git clone https://github.com/LazyVim/starter "$nvim_dir"
-    rm -rf "$nvim_dir/.git"
-  fi
-
-  mkdir -p "$nvim_dir/lua/plugins"
-  cat >"$nvim_dir/lua/plugins/catppuccin.lua" <<'EOF'
-return {
-  {
-    "catppuccin/nvim",
-    name = "catppuccin",
-    priority = 1000,
-    opts = {
-      flavour = "mocha",
-      transparent_background = false,
-      integrations = {
-        cmp = true,
-        gitsigns = true,
-        native_lsp = { enabled = true },
-        telescope = true,
-        treesitter = true,
-        which_key = true,
-      },
-    },
-  },
-}
-EOF
-
-  mkdir -p "$nvim_dir/lua/config"
-  if [[ ! -f "$nvim_dir/lua/config/options.lua" ]]; then
-    cat >"$nvim_dir/lua/config/options.lua" <<'EOF'
-vim.g.mapleader = " "
-vim.o.termguicolors = true
-vim.cmd.colorscheme("catppuccin-mocha")
-EOF
-  else
-    if ! grep -q 'catppuccin-mocha' "$nvim_dir/lua/config/options.lua"; then
-      echo 'vim.cmd.colorscheme("catppuccin-mocha")' >>"$nvim_dir/lua/config/options.lua"
+  if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved\.service'; then
+    run_sudo systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
+    if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+      run_sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
     fi
   fi
 }
 
-# ----------------------------
-# Omarchy theme layer
-# - Waybar config + style.css copied EXACTLY (from pinned theme)
-# - Others best-effort if present
-# ----------------------------
-apply_omarchy_catppuccin_theme() {
-  log "Applying Omarchy theme assets (pinned): ${OMARCHY_TAG} / themes/${THEME_NAME}"
+force_nm_dns() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+  local con
+  con="$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="wifi"||$2=="ethernet"{print $1; exit}')"
+  [[ -n "${con:-}" ]] || return 0
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
-
-  local archive_url="https://github.com/basecamp/omarchy/archive/refs/tags/${OMARCHY_TAG}.tar.gz"
-  curl -fsSL "$archive_url" -o "$tmpdir/omarchy.tar.gz" || die "Failed to download: $archive_url"
-  tar -xzf "$tmpdir/omarchy.tar.gz" -C "$tmpdir"
-
-  local root
-  root="$(find "$tmpdir" -maxdepth 1 -type d -name "omarchy-*" | head -n1)"
-  [[ -n "$root" ]] || die "Could not locate extracted omarchy directory"
-
-  local theme_dir="$root/themes/${THEME_NAME}"
-  [[ -d "$theme_dir" ]] || die "Theme directory not found: $theme_dir"
-
-  # Waybar (EXACT)
-  mkdir -p "$HOME/.config/waybar"
-  if [[ -f "$theme_dir/waybar/config.jsonc" ]]; then
-    cp -f "$theme_dir/waybar/config.jsonc" "$HOME/.config/waybar/config.jsonc"
-  fi
-  if [[ -f "$theme_dir/waybar/style.css" ]]; then
-    cp -f "$theme_dir/waybar/style.css" "$HOME/.config/waybar/style.css"
-  fi
-
-  # Mako (best effort)
-  if [[ -f "$theme_dir/mako/config" ]]; then
-    mkdir -p "$HOME/.config/mako"
-    cp -f "$theme_dir/mako/config" "$HOME/.config/mako/config"
-  fi
-
-  # Alacritty theme (best effort)
-  if [[ -d "$theme_dir/alacritty" ]]; then
-    mkdir -p "$HOME/.config/alacritty"
-    cp -rf "$theme_dir/alacritty/." "$HOME/.config/alacritty/"
-  fi
-
-  # Hyprlock theme (best effort)
-  if [[ -f "$theme_dir/hyprlock.conf" ]]; then
-    mkdir -p "$HOME/.config/hypr"
-    cp -f "$theme_dir/hyprlock.conf" "$HOME/.config/hypr/hyprlock.conf"
-  fi
-
-  # Walker theme (best effort)
-  if [[ -d "$theme_dir/walker" ]]; then
-    mkdir -p "$HOME/.config/walker"
-    cp -rf "$theme_dir/walker/." "$HOME/.config/walker/"
-  fi
-
-  # Wallpaper (best effort)
-  mkdir -p "$HOME/.local/share/backgrounds"
-  if compgen -G "$theme_dir/*background*" >/dev/null; then
-    local bg
-    bg="$(ls -1 "$theme_dir"/*background* 2>/dev/null | head -n1 || true)"
-    [[ -n "$bg" ]] && cp -f "$bg" "$HOME/.local/share/backgrounds/current"
-  fi
-
-  # Omarchy font (best effort)
-  if [[ -f "$root/config/omarchy.ttf" ]]; then
-    mkdir -p "$HOME/.local/share/fonts"
-    cp -f "$root/config/omarchy.ttf" "$HOME/.local/share/fonts/omarchy.ttf"
-  fi
-  fc-cache -f >/dev/null 2>&1 || true
-
-  pkill waybar >/dev/null 2>&1 || true
-  pkill mako >/dev/null 2>&1 || true
-
-  log "Theme applied (Waybar files copied verbatim where present)."
+  say "Forcing NetworkManager DNS on '$con' to: 1.1.1.1 8.8.8.8"
+  run_sudo nmcli con mod "$con" ipv4.ignore-auto-dns yes || true
+  run_sudo nmcli con mod "$con" ipv4.dns "1.1.1.1 8.8.8.8" || true
+  run_sudo nmcli con up "$con" >/dev/null 2>&1 || true
 }
 
-# ----------------------------
-# Hyprland config (KEYBINDINGS LOCKED)
-# - $mod=ALT, $mod2=SUPER
-# - ALT+D walker
-# - SUPER+Space XKB layout toggle (grp:win_space_toggle)
-# - Webapps (ALT + G/Y/C/W/E/T) in Brave app mode
-# ----------------------------
-write_hyprland_config() {
-  log "Writing Hyprland config (locked bindings + input layout toggle)"
+wait_for_dns() {
+  local host="${1:-github.com}"
+  local tries="${2:-60}"
 
-  mkdir -p "$HOME/.config/hypr"
-  mkdir -p "$HOME/Pictures/Screenshots"
+  say "Waiting for DNS resolution of ${host} (up to ${tries}s)"
+  for ((i=1; i<=tries; i++)); do
+    if getent ahosts "$host" >/dev/null 2>&1; then
+      say "DNS OK: ${host}"
+      return 0
+    fi
+    sleep 1
+  done
 
-  cat >"$HOME/.config/hypr/hyprland.conf" <<'EOF'
-# cortados hyprland.conf (locked)
-$mod  = ALT
-$mod2 = SUPER
-
-$term    = alacritty
-$menu    = walker
-$browser = brave
-$webapp  = brave --ozone-platform=wayland --app
-
-# Environment hinting for portals
-env = XDG_CURRENT_DESKTOP,Hyprland
-
-# Start required session helpers
-exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
-exec-once = /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
-exec-once = waybar
-exec-once = mako
-
-# Launcher / terminal / browser
-bind = $mod, Return, exec, $term
-bind = $mod, D, exec, $menu
-bind = $mod, B, exec, $browser
-
-# Webapps (Brave app-mode)
-bind = $mod, G, exec, $webapp=https://github.com
-bind = $mod, Y, exec, $webapp=https://youtube.com
-bind = $mod, C, exec, $webapp=https://chatgpt.com
-bind = $mod, W, exec, $webapp=https://web.whatsapp.com
-bind = $mod, E, exec, $webapp=https://gmail.com
-bind = $mod, T, exec, $webapp=https://twitch.com
-
-# Window management
-bind = $mod SHIFT, Q, killactive
-bind = $mod, F, fullscreen, 1
-bind = $mod, S, togglefloating
-bind = $mod SHIFT, R, exec, hyprctl reload
-
-# Focus (vim keys)
-bind = $mod, H, movefocus, l
-bind = $mod, J, movefocus, d
-bind = $mod, K, movefocus, u
-bind = $mod, L, movefocus, r
-
-# Move windows
-bind = $mod SHIFT, H, movewindow, l
-bind = $mod SHIFT, J, movewindow, d
-bind = $mod SHIFT, K, movewindow, u
-bind = $mod SHIFT, L, movewindow, r
-
-# Layout toggles
-bind = $mod, V, togglesplit
-bind = $mod, P, pseudo
-
-# Lock (avoid conflict with $mod SHIFT+L window-move)
-bind = $mod2 SHIFT, L, exec, hyprlock
-
-# Screenshots
-bind = , Print, exec, bash -lc 'grim -g "$(slurp)" "$HOME/Pictures/Screenshots/$(date +%F_%H-%M-%S).png"'
-bind = $mod, Print, exec, bash -lc 'grim -g "$(slurp)" - | satty -f -'
-
-# Media keys
-bind = , XF86AudioRaiseVolume, exec, pamixer -i 5
-bind = , XF86AudioLowerVolume, exec, pamixer -d 5
-bind = , XF86AudioMute, exec, pamixer -t
-bind = , XF86AudioPlay, exec, playerctl play-pause
-bind = , XF86AudioNext, exec, playerctl next
-bind = , XF86AudioPrev, exec, playerctl previous
-bind = , XF86MonBrightnessUp, exec, brightnessctl set +10%
-bind = , XF86MonBrightnessDown, exec, brightnessctl set 10%-
-
-# Comfortable layout / minimal blur
-general {
-  gaps_in = 8
-  gaps_out = 12
-  border_size = 2
+  say "DNS failed for ${host}. Debug:"
+  command -v resolvectl >/dev/null 2>&1 && resolvectl status || true
+  cat /etc/resolv.conf || true
+  return 1
 }
 
-decoration {
-  rounding = 8
-  active_opacity = 1.0
-  inactive_opacity = 1.0
-  drop_shadow = yes
-  shadow_range = 12
-  shadow_render_power = 2
-  blur {
-    enabled = no
-  }
+wait_for_http() {
+  local url="${1:-https://github.com}"
+  local tries="${2:-20}"
+
+  command -v curl >/dev/null 2>&1 || return 0
+  say "Checking HTTPS reachability: ${url} (up to ${tries}s)"
+  for ((i=1; i<=tries; i++)); do
+    if curl -fsSL --max-time 5 "$url" >/dev/null 2>&1; then
+      say "HTTPS OK."
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
-animations {
-  enabled = no
+is_online() {
+  # Quick and dependable: IP connectivity + DNS resolution
+  ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && getent ahosts github.com >/dev/null 2>&1
 }
 
-# Keyboard layouts (native XKB toggle)
-# SUPER+Space toggles layouts via grp:win_space_toggle
-input {
-  kb_layout  = gb,us
-  kb_variant = ,dvorak
-  kb_options = grp:win_space_toggle
-  follow_mouse = 1
+# ------------------------------------------------------------------------------
+# Interactive Wi-Fi connect (nmcli)
+# ------------------------------------------------------------------------------
+interactive_wifi_connect_if_offline() {
+  command -v nmcli >/dev/null 2>&1 || return 0
+
+  if is_online; then
+    say "Network appears online; skipping Wi-Fi prompt."
+    return 0
+  fi
+
+  # Prefer ethernet if it is connected (no need to prompt)
+  if nmcli -t -f TYPE,STATE dev status 2>/dev/null | grep -q '^ethernet:connected'; then
+    say "Ethernet connected but DNS/IP check failed; continuing without Wi-Fi prompt."
+    return 0
+  fi
+
+  # Find a Wi-Fi device
+  local wifi_dev
+  wifi_dev="$(nmcli -t -f DEVICE,TYPE dev status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
+  [[ -n "${wifi_dev:-}" ]] || { say "No Wi-Fi device detected; skipping Wi-Fi prompt."; return 0; }
+
+  # Unblock Wi-Fi if rfkill exists
+  if command -v rfkill >/dev/null 2>&1; then
+    run_sudo rfkill unblock wifi >/dev/null 2>&1 || true
+  fi
+
+  # Ensure Wi-Fi radio is on
+  nmcli radio wifi on >/dev/null 2>&1 || true
+
+  say "Offline detected. Starting interactive Wi-Fi setup (device: ${wifi_dev})."
+  say "Scanning networks..."
+  nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true
+
+  local attempts=0
+  local max_attempts=3
+
+  while (( attempts < max_attempts )); do
+    attempts=$((attempts+1))
+
+    local ssid sec km psk
+    read -r -p "Enter SSID (Wi-Fi name). Leave empty to re-list: " ssid
+    if [[ -z "${ssid}" ]]; then
+      nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true
+      continue
+    fi
+
+    # Try to look up SECURITY for that SSID (best effort)
+    sec="$(nmcli -t -f SSID,SECURITY dev wifi list ifname "${wifi_dev}" 2>/dev/null | awk -F: -v s="${ssid}" '$1==s{print $2; exit}')"
+    sec="${sec:-unknown}"
+
+    # Determine key management
+    # - WPA3 → SAE
+    # - WPA/WPA2 → WPA-PSK
+    # - open → no password
+    if [[ "${sec}" == "--" || "${sec}" == "NONE" ]]; then
+      say "Detected open network (no password). Connecting..."
+      if nmcli dev wifi connect "${ssid}" ifname "${wifi_dev}"; then
+        break
+      fi
+      say "Connect failed. Try again."
+      continue
+    fi
+
+    if echo "${sec}" | grep -qi 'WPA3'; then
+      km="sae"
+    else
+      km="wpa-psk"
+    fi
+
+    read -r -s -p "Enter Wi-Fi password for '${ssid}': " psk
+    echo ""
+
+    say "Connecting to '${ssid}' (security: ${sec}, key-mgmt: ${km})..."
+    # Use property form (after --) to avoid "invalid extra argument" issues
+    if nmcli dev wifi connect "${ssid}" password "${psk}" ifname "${wifi_dev}" -- 802-11-wireless-security.key-mgmt "${km}"; then
+      break
+    fi
+
+    say "Connect failed (attempt ${attempts}/${max_attempts})."
+    say "Tip: if this is WPA3-only and SAE fails, your network may be mixed-mode; try again or use a different AP."
+  done
+
+  if is_online; then
+    say "Online confirmed."
+    return 0
+  fi
+
+  # As a pragmatic fallback for flaky router DNS
+  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
+    force_nm_dns
+  fi
+
+  if is_online; then
+    say "Online confirmed after DNS override."
+    return 0
+  fi
+
+  die "Still offline after Wi-Fi attempts. Connect to a network, then rerun this script."
 }
+
+# ------------------------------------------------------------------------------
+# Pacman
+# ------------------------------------------------------------------------------
+pacman_bootstrap() {
+  say "Refreshing keyring + syncing databases…"
+  run_sudo pacman -Sy --noconfirm archlinux-keyring >/dev/null 2>&1 || true
+  run_sudo pacman -Syyu --noconfirm || true
+}
+
+pacman_install_strict() {
+  local pkgs=("$@")
+  say "Installing (strict) (${#pkgs[@]}): ${pkgs[*]}"
+  run_sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+}
+
+pacman_install_best_effort() {
+  local pkgs=("$@")
+  local ok=()
+  local missing=()
+
+  for p in "${pkgs[@]}"; do
+    if pacman -Si "$p" >/dev/null 2>&1; then
+      ok+=("$p")
+    else
+      missing+=("$p")
+    fi
+  done
+
+  if ((${#missing[@]} > 0)); then
+    say "Skipping missing packages (not in current repos): ${missing[*]}"
+  fi
+
+  if ((${#ok[@]} > 0)); then
+    say "Installing (best-effort) (${#ok[@]}): ${ok[*]}"
+    run_sudo pacman -S --noconfirm --needed "${ok[@]}" || true
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Git clone with retry
+# ------------------------------------------------------------------------------
+git_clone_retry() {
+  local repo="$1"
+  local dest="$2"
+  local depth="${3:-1}"
+  local n=0
+  local max=5
+
+  while true; do
+    if [[ -d "$dest/.git" ]]; then
+      say "Repo already present: $dest (skipping clone)"
+      return 0
+    fi
+
+    if [[ -e "$dest" && ! -d "$dest/.git" ]]; then
+      local backup="${dest}.bak.$(date +%Y%m%d%H%M%S)"
+      say "Destination exists but is not a git repo. Moving to: $backup"
+      mv "$dest" "$backup"
+    fi
+
+    say "Cloning: $repo -> $dest"
+    if git clone --depth "$depth" "$repo" "$dest"; then
+      return 0
+    fi
+
+    n=$((n+1))
+    if [[ "$n" -ge "$max" ]]; then
+      die "Failed to clone after ${max} attempts: $repo"
+    fi
+    say "Clone failed; retrying in $((n*2))s…"
+    sleep $((n*2))
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Package sets
+# ------------------------------------------------------------------------------
+define_packages() {
+  BASE_PKGS=(
+    base-devel
+    git curl wget ca-certificates
+    unzip zip
+    gnupg
+    openssh
+    rsync
+    jq yq
+    ripgrep fd
+    fzf
+    bat eza
+    btop htop
+    tmux
+    neovim
+    shellcheck shfmt
+    tree
+  )
+
+  WAYLAND_PKGS=(
+    hyprland
+    xdg-desktop-portal xdg-desktop-portal-hyprland
+    waybar
+    mako
+    fuzzel
+    wl-clipboard
+    grim slurp
+    swappy
+    brightnessctl
+    playerctl
+    polkit-gnome
+    qt5-wayland qt6-wayland
+  )
+
+  # Audio: PipeWire (no pipewire-jack to avoid jack2 conflicts)
+  HW_PKGS=(
+    pipewire pipewire-alsa pipewire-pulse
+    wireplumber
+    pavucontrol
+    networkmanager
+    bluez bluez-utils
+    blueman
+  )
+
+  FONTS_PKGS=(
+    ttf-hack-nerd
+    noto-fonts noto-fonts-emoji
+  )
+
+  TERMINAL_PKGS=( alacritty )
+  BROWSER_PKGS=( chromium )
+
+  DEVOPS_PKGS=(
+    terraform
+    terragrunt
+    kubectl
+    kustomize
+    helm
+    k9s
+    sops
+    age
+    aws-cli
+    azure-cli
+    docker docker-compose
+    python python-pip
+    go
+    nodejs npm
+    kubectx
+    stern
+    lazygit
+  )
+
+  EXTRAS_PKGS=(
+    less
+    man-db man-pages
+    inetutils
+    bind
+    traceroute
+    openssl
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Post-install
+# ------------------------------------------------------------------------------
+enable_services() {
+  say "Enabling core services…"
+  run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
+  run_sudo systemctl enable --now bluetooth >/dev/null 2>&1 || true
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
+    run_sudo systemctl enable --now docker >/dev/null 2>&1 || true
+    if getent group docker >/dev/null 2>&1; then
+      if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
+        say "Adding user '$USER' to docker group (logout/login required)"
+        run_sudo usermod -aG docker "$USER" || true
+      fi
+    fi
+  fi
+}
+
+setup_fuzzel_config() {
+  local dir="${HOME}/.config/fuzzel"
+  local cfg="${dir}/fuzzel.ini"
+  mkdir -p "$dir"
+
+  if [[ -f "$cfg" ]]; then
+    say "Fuzzel config exists: $cfg (skipping)"
+    return 0
+  fi
+
+  say "Writing default fuzzel config: $cfg"
+  cat >"$cfg" <<'EOF'
+[main]
+terminal=alacritty -e
+prompt=>
+layer=overlay
+fields=name,generic,comment,categories,filename,keywords
+
+[border]
+width=2
+radius=8
 EOF
 }
 
-# ----------------------------
-# Install all phases
-# ----------------------------
-install_all() {
-  local gpu
-  gpu="$(detect_gpu)"
-  log "Detected GPU: $gpu"
+setup_lazyvim() {
+  need_cmd git
+  mkdir -p "${HOME}/.config"
+  local nvim_dir="${HOME}/.config/nvim"
 
-  local -a pac_pkgs=()
-  local -a aur_pkgs=()
+  git_clone_retry "https://github.com/LazyVim/starter.git" "$nvim_dir" 1
 
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    if pacman_has_pkg "$p"; then pac_pkgs+=("$p"); else aur_pkgs+=("$p"); fi
-  done < <(phase1_packages)
+  local detach="${DETACH_LAZYVIM:-1}"
+  if [[ "$detach" == "1" && -d "$nvim_dir/.git" ]]; then
+    say "Detaching LazyVim starter (removing ${nvim_dir}/.git)"
+    rm -rf "$nvim_dir/.git"
+  fi
+}
 
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    if pacman_has_pkg "$p"; then pac_pkgs+=("$p"); else aur_pkgs+=("$p"); fi
-  done < <(phase2_packages "$gpu")
+set_default_browser_chromium() {
+  if command -v xdg-settings >/dev/null 2>&1; then
+    xdg-settings set default-web-browser chromium.desktop >/dev/null 2>&1 || true
+  fi
+  if command -v xdg-mime >/dev/null 2>&1; then
+    xdg-mime default chromium.desktop x-scheme-handler/http >/dev/null 2>&1 || true
+    xdg-mime default chromium.desktop x-scheme-handler/https >/dev/null 2>&1 || true
+  fi
+}
 
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    if pacman_has_pkg "$p"; then pac_pkgs+=("$p"); else aur_pkgs+=("$p"); fi
-  done < <(phase3_packages)
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+main() {
+  require_pacman_system
+  need_cmd systemctl
+  need_cmd getent
 
-  while IFS= read -r p; do
-    [[ -z "$p" ]] && continue
-    aur_pkgs+=("$p")
-  done < <(phase3_aur_packages)
+  ensure_network_services
 
-  mapfile -t pac_pkgs < <(printf "%s\n" "${pac_pkgs[@]}" | awk '!seen[$0]++')
-  mapfile -t aur_pkgs < <(printf "%s\n" "${aur_pkgs[@]}" | awk '!seen[$0]++')
+  # If you're offline, prompt to connect to Wi-Fi before doing anything else.
+  interactive_wifi_connect_if_offline
 
-  install_pacman "${pac_pkgs[@]}"
-  install_aur "${aur_pkgs[@]}"
+  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
+    force_nm_dns
+  fi
+
+  # Gate on DNS for the two hosts commonly used during bootstrap
+  if ! wait_for_dns github.com 30; then
+    force_nm_dns
+    wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."
+  fi
+  if ! wait_for_dns raw.githubusercontent.com 30; then
+    force_nm_dns
+    wait_for_dns raw.githubusercontent.com 60 || die "DNS not working; connect to network and retry."
+  fi
+  wait_for_http "https://github.com" 10 || say "Warning: HTTPS check failed; continuing."
+
+  pacman_bootstrap
+  define_packages
+
+  pacman_install_strict \
+    "${BASE_PKGS[@]}" \
+    "${WAYLAND_PKGS[@]}" \
+    "${HW_PKGS[@]}" \
+    "${FONTS_PKGS[@]}" \
+    "${TERMINAL_PKGS[@]}" \
+    "${BROWSER_PKGS[@]}" \
+    "${EXTRAS_PKGS[@]}"
+
+  pacman_install_best_effort "${DEVOPS_PKGS[@]}"
 
   enable_services
-  configure_zram
-  configure_tty_autostart
-  write_hyprland_config
-  install_lazyvim
-  apply_omarchy_catppuccin_theme
+  setup_fuzzel_config
+  setup_lazyvim
+  set_default_browser_chromium
 
-  log "Done. Reboot recommended."
-  warn "If docker group was newly added, log out/in (or reboot) for docker group membership to apply."
-}
-
-usage() {
-  cat <<EOF
-Usage: ./cortados.sh
-
-Environment flags:
-  ENABLE_BLUETOOTH=1|0    (default: 1)
-  ENABLE_T2=1|0           (default: 0)
-  OMARCHY_TAG=vX.Y.Z      (default: v3.2.3)
-  THEME_NAME=catppuccin   (default: catppuccin)
-  INSTALL_LAZYVIM=1|0     (default: 1)
-
-Example:
-  ENABLE_T2=0 ENABLE_BLUETOOTH=1 ./cortados.sh
-EOF
-}
-
-main() {
-  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    usage
-    exit 0
-  fi
-
-  preflight
-  install_all
+  say "Complete."
+  say "If you were added to the docker group: log out/in to use docker without sudo."
+  say "Run: nvim (to let plugins install)"
 }
 
 main "$@"
