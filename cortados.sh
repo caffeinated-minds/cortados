@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
 # cortados.sh — Arch → Hyprland workstation (Omarchy-like, minimal, reproducible)
-# Goals:
-# - pacman-only bootstrap (NO AUR, no yay)
-# - reliable first-run on hostile networks
+# - pacman-only bootstrap (NO AUR)
 # - fuzzel launcher (apps + lock + shutdown + reboot)
-# - Catppuccin-like local theming (no Omarchy theme downloads)
-# - TTY autostart via dbus-run-session (no display manager)
+# - Catppuccin-like local theming (no Omarchy downloads)
+# - TTY autostart via dbus-run-session
+# - DevOps tooling included (terraform/k8s/yaml/etc)
 
 set -euo pipefail
 
 # ----------------------------
 # User-tunable knobs
 # ----------------------------
-ENABLE_BLUETOOTH="${ENABLE_BLUETOOTH:-1}"      # 1=install+enable bluetooth stack
-ENABLE_DOCKER="${ENABLE_DOCKER:-1}"            # 1=install+enable docker
-INSTALL_LAZYVIM="${INSTALL_LAZYVIM:-1}"        # 1=install LazyVim starter
-INSTALL_BRAVE="${INSTALL_BRAVE:-0}"            # 1=attempt Brave install (see note below)
-BRAVE_METHOD="${BRAVE_METHOD:-flatpak}"        # flatpak|skip  (Brave has no official pacman repo for Arch)
-
-# NOTE: Brave on Arch is officially documented as "use AUR (brave-bin)".
-# Since this script removes AUR by design, the supported browser defaults to Firefox.
-# If INSTALL_BRAVE=1 and BRAVE_METHOD=flatpak, Brave will be installed via Flatpak.
+ENABLE_BLUETOOTH="${ENABLE_BLUETOOTH:-1}"   # 1=install+enable bluetooth stack
+ENABLE_DOCKER="${ENABLE_DOCKER:-1}"         # 1=install+enable docker
+INSTALL_LAZYVIM="${INSTALL_LAZYVIM:-1}"     # 1=install LazyVim starter
+ENABLE_PRINTING="${ENABLE_PRINTING:-1}"     # 1=install cups + printer tools
 
 # ----------------------------
 # Logging helpers
@@ -28,7 +22,6 @@ BRAVE_METHOD="${BRAVE_METHOD:-flatpak}"        # flatpak|skip  (Brave has no off
 log()  { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
 warn() { printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
 die()  { printf "\033[1;31m[x] %s\033[0m\n" "$*"; exit 1; }
-
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
 # ----------------------------
@@ -43,11 +36,15 @@ preflight() {
     die "Run as a normal user with sudo, not as root."
   fi
 
-  log "Refreshing pacman database + system update"
+  # Ensure keyring is sane on fresh installs
+  log "Refreshing pacman keyring + syncing databases"
+  sudo pacman -Sy --noconfirm archlinux-keyring || true
+
+  log "Full system update"
   sudo pacman -Syu --noconfirm
 
-  log "Ensuring build + download essentials"
-  sudo pacman -S --needed --noconfirm base-devel git curl tar unzip
+  log "Ensuring base build + download essentials"
+  sudo pacman -S --needed --noconfirm base-devel git curl ca-certificates tar unzip
 
   need_cmd curl
   need_cmd git
@@ -67,42 +64,75 @@ detect_gpu() {
 }
 
 # ----------------------------
-# Packages
+# Package lists (ONE PER LINE, ALWAYS)
 # ----------------------------
 packages_base() {
   cat <<'EOF'
-# Base essentials
-base linux linux-firmware linux-headers
-bash-completion man-db less
-git curl wget unzip
+base
+linux
+linux-firmware
+linux-headers
+bash-completion
+man-db
+less
+git
+curl
+wget
+unzip
+tar
 pciutils
+openssh
 
 # Wayland + Hyprland
-hyprland hypridle hyprlock hyprpicker
-xdg-desktop-portal-hyprland xdg-desktop-portal-gtk
-qt5-wayland qt6-wayland egl-wayland
+hyprland
+hypridle
+hyprlock
+hyprpicker
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk
+qt5-wayland
+qt6-wayland
+egl-wayland
 
 # Bar/notifications/background/osd
-waybar mako swaybg swayosd
+waybar
+mako
+swaybg
+swayosd
 
 # Launcher
 fuzzel
 
+# Terminal / basic UX
+alacritty
+tmux
+
 # Screenshots/clipboard
-grim slurp wl-clipboard satty
+grim
+slurp
+wl-clipboard
+swappy
 
 # Audio
-pipewire pipewire-alsa pipewire-pulse wireplumber
-gst-plugin-pipewire pamixer playerctl
+pipewire
+pipewire-alsa
+pipewire-pulse
+wireplumber
+gst-plugin-pipewire
+pamixer
+playerctl
 
-# Networking (predictable)
+# Networking (reliable bootstrap)
 networkmanager
-avahi nss-mdns
+avahi
+nss-mdns
 
 # Fonts
-noto-fonts noto-fonts-emoji ttf-hack-nerd
+noto-fonts
+noto-fonts-emoji
+ttf-hack-nerd
 
-# Session/permissions
+# Polkit agent
 polkit-gnome
 
 # Laptop defaults
@@ -113,7 +143,26 @@ brightnessctl
 zram-generator
 
 # CLI QoL
-bat eza btop fastfetch dust tldr zoxide starship
+bat
+eza
+btop
+fastfetch
+dust
+tldr
+zoxide
+starship
+
+# Dev essentials
+neovim
+python
+python-pip
+python-virtualenv
+nodejs
+npm
+corepack
+go
+jq
+yq
 EOF
 }
 
@@ -122,7 +171,9 @@ packages_gpu_extras() {
   case "$gpu" in
     nvidia)
       cat <<'EOF'
-nvidia-open-dkms nvidia-utils lib32-nvidia-utils egl-wayland
+nvidia-open-dkms
+nvidia-utils
+lib32-nvidia-utils
 EOF
       ;;
     intel)
@@ -131,54 +182,59 @@ libva-intel-driver
 EOF
       ;;
     amd)
-      cat <<'EOF'
-# (no extra packages required)
-EOF
-      ;;
+      : ;;
     *)
-      cat <<'EOF'
-# (unknown GPU, skipping GPU extras)
-EOF
-      ;;
+      : ;;
   esac
 }
 
-packages_optional() {
+packages_devops() {
   cat <<'EOF'
-# Printing (socket-activated)
-cups cups-filters cups-browsed cups-pdf system-config-printer
-EOF
-  if [[ "$ENABLE_BLUETOOTH" == "1" ]]; then
-    cat <<'EOF'
-bluez bluez-utils
-EOF
-  fi
-  if [[ "$ENABLE_DOCKER" == "1" ]]; then
-    cat <<'EOF'
-docker docker-buildx docker-compose
-EOF
-  fi
-  # Dev toolchains (keep modest; add more later as needed)
-  cat <<'EOF'
-neovim tmux
-python python-pip python-virtualenv
-nodejs npm corepack
-go
+terraform
+kubectl
+helm
+k9s
+kustomize
 EOF
 }
 
-install_pacman_list() {
-  local tmp
-  tmp="$(mktemp)"
-  trap 'rm -f "$tmp"' RETURN
+packages_optional() {
+  if [[ "$ENABLE_PRINTING" == "1" ]]; then
+    cat <<'EOF'
+cups
+cups-filters
+cups-browsed
+cups-pdf
+system-config-printer
+EOF
+  fi
 
-  { packages_base; packages_gpu_extras "$1"; packages_optional; } \
-    | sed 's/#.*$//' \
-    | awk 'NF{print $0}' \
-    | awk '!seen[$0]++' >"$tmp"
+  if [[ "$ENABLE_BLUETOOTH" == "1" ]]; then
+    cat <<'EOF'
+bluez
+bluez-utils
+EOF
+  fi
 
-  local -a pkgs=()
-  mapfile -t pkgs <"$tmp"
+  if [[ "$ENABLE_DOCKER" == "1" ]]; then
+    cat <<'EOF'
+docker
+docker-buildx
+docker-compose
+EOF
+  fi
+}
+
+install_pacman_all() {
+  local gpu="$1"
+
+  # Build one-per-line list, strip comments/empties, de-dupe
+  mapfile -t pkgs < <(
+    { packages_base; packages_gpu_extras "$gpu"; packages_devops; packages_optional; } \
+      | sed 's/#.*$//' \
+      | awk 'NF{print $0}' \
+      | awk '!seen[$0]++'
+  )
 
   log "Installing (pacman): ${#pkgs[@]} packages"
   sudo pacman -S --needed --noconfirm "${pkgs[@]}"
@@ -192,8 +248,10 @@ enable_services() {
   sudo systemctl enable --now NetworkManager.service
   sudo systemctl enable --now avahi-daemon.service
 
-  log "Enabling printing via socket activation (cups.socket)"
-  sudo systemctl enable --now cups.socket
+  if [[ "$ENABLE_PRINTING" == "1" ]]; then
+    log "Enabling printing via socket activation (cups.socket)"
+    sudo systemctl enable --now cups.socket
+  fi
 
   log "Enabling power-profiles-daemon"
   sudo systemctl enable --now power-profiles-daemon.service
@@ -304,7 +362,6 @@ write_mako_config() {
   log "Writing mako config (Catppuccin-like defaults)"
   mkdir -p "$HOME/.config/mako"
   cat >"$HOME/.config/mako/config" <<'EOF'
-# cortados mako (Catppuccin-like)
 background-color=#1e1e2e
 text-color=#cdd6f4
 border-color=#89b4fa
@@ -385,7 +442,6 @@ write_waybar_config() {
 EOF
 
   cat >"$HOME/.config/waybar/style.css" <<'EOF'
-/* cortados waybar (Catppuccin-like, minimal) */
 * {
   border: none;
   border-radius: 0;
@@ -395,25 +451,25 @@ EOF
 }
 
 window#waybar {
-  background: rgba(30, 30, 46, 0.92); /* base */
-  color: #cdd6f4; /* text */
+  background: rgba(30, 30, 46, 0.92);
+  color: #cdd6f4;
 }
 
 #workspaces button {
   padding: 0 10px;
   margin: 6px 4px;
   border-radius: 10px;
-  background: rgba(49, 50, 68, 0.6); /* surface0 */
+  background: rgba(49, 50, 68, 0.6);
   color: #cdd6f4;
 }
 
 #workspaces button.active {
-  background: rgba(137, 180, 250, 0.9); /* blue */
+  background: rgba(137, 180, 250, 0.9);
   color: #1e1e2e;
 }
 
 #workspaces button.urgent {
-  background: rgba(243, 139, 168, 0.9); /* red/pink */
+  background: rgba(243, 139, 168, 0.9);
   color: #1e1e2e;
 }
 
@@ -439,53 +495,24 @@ EOF
 }
 
 # ----------------------------
-# Browser install (Brave optional via Flatpak; default Firefox via pacman)
-# ----------------------------
-install_browser() {
-  log "Installing default browser (Firefox)"
-  sudo pacman -S --needed --noconfirm firefox
-
-  if [[ "$INSTALL_BRAVE" != "1" ]]; then
-    return 0
-  fi
-
-  if [[ "$BRAVE_METHOD" == "flatpak" ]]; then
-    log "Installing Brave via Flatpak (optional)"
-    sudo pacman -S --needed --noconfirm flatpak
-    # Flathub remote
-    if ! flatpak remote-list | awk '{print $1}' | grep -qx flathub; then
-      sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-    fi
-    sudo flatpak install -y flathub com.brave.Browser
-  else
-    warn "Brave install requested but BRAVE_METHOD=$BRAVE_METHOD is unsupported. Skipping."
-  fi
-}
-
-# ----------------------------
 # Hyprland config (bindings)
 # - $mod=ALT, $mod2=SUPER
 # - ALT+D launcher (fuzzel menu)
 # - SUPER+Space XKB layout toggle (grp:win_space_toggle)
-# - Webapps use brave if installed, else firefox
 # ----------------------------
 write_hyprland_config() {
-  log "Writing Hyprland config (fuzzel launcher + native layout toggle)"
+  log "Writing Hyprland config"
 
   mkdir -p "$HOME/.config/hypr"
   mkdir -p "$HOME/Pictures/Screenshots"
 
   cat >"$HOME/.config/hypr/hyprland.conf" <<'EOF'
-# cortados hyprland.conf (pacman-only bootstrap)
 $mod  = ALT
 $mod2 = SUPER
 
 $term    = alacritty
 $menu    = $HOME/.local/bin/launcher
-
-# Prefer brave-browser if present; fallback to firefox
-$browser = bash -lc 'command -v brave-browser >/dev/null && exec brave-browser || exec firefox'
-$webapp  = bash -lc 'command -v brave-browser >/dev/null && exec brave-browser --ozone-platform=wayland --app="$1" || exec firefox "$1"'
+$browser = firefox
 
 exec-once = waybar
 exec-once = mako
@@ -495,13 +522,13 @@ bind = $mod, Return, exec, $term
 bind = $mod, D, exec, $menu
 bind = $mod, B, exec, $browser
 
-# Webapps
-bind = $mod, G, exec, bash -lc '$webapp https://github.com'
-bind = $mod, Y, exec, bash -lc '$webapp https://youtube.com'
-bind = $mod, C, exec, bash -lc '$webapp https://chatgpt.com'
-bind = $mod, W, exec, bash -lc '$webapp https://web.whatsapp.com'
-bind = $mod, E, exec, bash -lc '$webapp https://gmail.com'
-bind = $mod, T, exec, bash -lc '$webapp https://twitch.com'
+# Webapps (open normal tabs in firefox; app-mode requires Brave/Chromium tooling)
+bind = $mod, G, exec, firefox https://github.com
+bind = $mod, Y, exec, firefox https://youtube.com
+bind = $mod, C, exec, firefox https://chatgpt.com
+bind = $mod, W, exec, firefox https://web.whatsapp.com
+bind = $mod, E, exec, firefox https://gmail.com
+bind = $mod, T, exec, firefox https://twitch.com
 
 # Window management
 bind = $mod SHIFT, Q, killactive
@@ -530,7 +557,7 @@ bind = $mod SHIFT, X, exec, hyprlock
 
 # Screenshots
 bind = , Print, exec, bash -lc 'grim -g "$(slurp)" "$HOME/Pictures/Screenshots/$(date +%F_%H-%M-%S).png"'
-bind = $mod, Print, exec, bash -lc 'grim -g "$(slurp)" - | satty -f -'
+bind = $mod, Print, exec, bash -lc 'grim -g "$(slurp)" - | swappy -f -'
 
 # Media keys
 bind = , XF86AudioRaiseVolume, exec, pamixer -i 5
@@ -542,7 +569,6 @@ bind = , XF86AudioPrev, exec, playerctl previous
 bind = , XF86MonBrightnessUp, exec, brightnessctl set +10%
 bind = , XF86MonBrightnessDown, exec, brightnessctl set 10%-
 
-# Comfortable layout / minimal effects
 general {
   gaps_in = 8
   gaps_out = 12
@@ -556,17 +582,12 @@ decoration {
   drop_shadow = yes
   shadow_range = 12
   shadow_render_power = 2
-  blur {
-    enabled = no
-  }
+  blur { enabled = no }
 }
 
-animations {
-  enabled = no
-}
+animations { enabled = no }
 
 # Keyboard layouts (native XKB toggle)
-# SUPER+Space toggles layouts via grp:win_space_toggle
 input {
   kb_layout  = gb,us
   kb_variant = ,dvorak
@@ -603,18 +624,7 @@ return {
     "catppuccin/nvim",
     name = "catppuccin",
     priority = 1000,
-    opts = {
-      flavour = "mocha",
-      transparent_background = false,
-      integrations = {
-        cmp = true,
-        gitsigns = true,
-        native_lsp = { enabled = true },
-        telescope = true,
-        treesitter = true,
-        which_key = true,
-      },
-    },
+    opts = { flavour = "mocha" },
   },
 }
 EOF
@@ -641,13 +651,11 @@ install_all() {
   gpu="$(detect_gpu)"
   log "Detected GPU: $gpu"
 
-  install_pacman_list "$gpu"
-  install_browser
+  install_pacman_all "$gpu"
   enable_services
   configure_zram
   configure_tty_autostart
 
-  # configs + theming
   write_launcher_script
   write_fuzzel_config
   write_mako_config
@@ -656,7 +664,6 @@ install_all() {
 
   install_lazyvim
 
-  # refresh font cache (best effort)
   fc-cache -f >/dev/null 2>&1 || true
 
   log "Done. Reboot recommended."
@@ -672,16 +679,8 @@ Usage: ./cortados.sh
 Environment flags:
   ENABLE_BLUETOOTH=1|0     (default: 1)
   ENABLE_DOCKER=1|0        (default: 1)
+  ENABLE_PRINTING=1|0      (default: 1)
   INSTALL_LAZYVIM=1|0      (default: 1)
-
-Browser:
-  INSTALL_BRAVE=1|0        (default: 0)
-  BRAVE_METHOD=flatpak     (default: flatpak)
-
-Notes:
-- This script intentionally avoids AUR and Omarchy GitHub theme downloads for reliability.
-- Brave has no official pacman repo for Arch; official guidance uses AUR (brave-bin).
-  This script can optionally install Brave via Flatpak instead.
 
 EOF
 }
