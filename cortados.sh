@@ -60,18 +60,22 @@ install_pacman() {
 ensure_yay() {
   command -v yay >/dev/null 2>&1 && return 0
 
+  # If yay exists in repos (rare), use it
   if pacman_has_pkg yay; then
     log "Installing yay via pacman"
     sudo pacman -S --needed --noconfirm yay
     return 0
   fi
 
-  log "Bootstrapping yay from AUR"
+  # Prefer yay-bin from AUR (prebuilt) to avoid source tarball builds
+  log "Bootstrapping yay-bin from AUR"
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' RETURN
-  git clone https://aur.archlinux.org/yay.git "$tmpdir/yay"
-  (cd "$tmpdir/yay" && makepkg -si --noconfirm)
+
+  # Clone the AUR PKGBUILD for yay-bin (not GitHub source)
+  git clone https://aur.archlinux.org/yay-bin.git "$tmpdir/yay-bin"
+  (cd "$tmpdir/yay-bin" && makepkg -si --noconfirm)
 }
 
 install_aur() {
@@ -215,7 +219,7 @@ phase3_packages() {
 
 phase3_aur_packages() {
   local -a aur_pkgs=(
-    brave-browser
+    brave-bin
     walker-bin
   )
   printf "%s\n" "${aur_pkgs[@]}"
