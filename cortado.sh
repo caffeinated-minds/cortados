@@ -3,20 +3,12 @@ set -euo pipefail
 
 # ==============================================================================
 # cortado.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
-#
-# Includes:
-# - Wi-Fi reliability (NetworkManager autoconnect + optional interactive connect)
-# - Waybar click actions (audio/network/bluetooth)
-# - Hyprland startup via dbus-run-session (no display manager)
-# - Optional TTY auto-login
-# - Hyprland default config (bindings + monitor layout) if missing (or forced)
-# - Bluetooth "pairing sticks" fixes:
-#   1) Ensure BlueZ AutoEnable=true (/etc/bluetooth/main.conf.d)
-#   2) Ensure bluetooth service enabled/started
-#   3) Ensure blueman-applet autostarts (provides agent so pairing/connecting persists)
+# Single-script, but correctly handles:
+#  - root tasks via sudo
+#  - user config tasks written to the *real* user home, even if invoked with sudo
 #
 # Controls (env vars):
-#   ENABLE_AUTOLOGIN=1    # enable auto-login on tty1 for current user (default: 0)
+#   ENABLE_AUTOLOGIN=1    # enable auto-login on tty1 for target user (default: 0)
 #   ENABLE_AUTOHYPR=1     # auto-start Hyprland on tty1 login (default: 1)
 #   FORCE_HYPR_CONF=1     # backup+replace ~/.config/hypr/hyprland.conf (default: 0)
 #   FORCE_WAYBAR=1        # backup+replace waybar config/style (default: 0)
@@ -30,6 +22,22 @@ die() { printf '%s ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
 run_sudo() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
+
+# --- determine real target user/home (critical fix) ---
+TARGET_USER="${SUDO_USER:-${USER:-}}"
+[[ -n "${TARGET_USER:-}" ]] || die "Could not determine target user."
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+[[ -n "${TARGET_HOME:-}" && -d "$TARGET_HOME" ]] || die "Could not determine home for user '$TARGET_USER'."
+
+as_user() {
+  # run command as target user with correct HOME
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    run_sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$*"
+  else
+    # already user; still enforce HOME/USER for safety
+    env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$*"
+  fi
+}
 
 # ------------------------------------------------------------------------------
 # Detect OS
@@ -56,7 +64,7 @@ ensure_network_services() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved\.service'; then
     run_sudo systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
     if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
-      run_sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf || true
+      run_sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf >/dev/null 2>&1 || true
     fi
   fi
 }
@@ -67,8 +75,8 @@ force_nm_dns() {
   con="$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="wifi"||$2=="ethernet"{print $1; exit}')"
   [[ -n "${con:-}" ]] || return 0
   say "Forcing NetworkManager DNS on '$con' to: 1.1.1.1 8.8.8.8"
-  run_sudo nmcli con mod "$con" ipv4.ignore-auto-dns yes || true
-  run_sudo nmcli con mod "$con" ipv4.dns "1.1.1.1 8.8.8.8" || true
+  run_sudo nmcli con mod "$con" ipv4.ignore-auto-dns yes >/dev/null 2>&1 || true
+  run_sudo nmcli con mod "$con" ipv4.dns "1.1.1.1 8.8.8.8" >/dev/null 2>&1 || true
   run_sudo nmcli con up "$con" >/dev/null 2>&1 || true
 }
 
@@ -125,11 +133,6 @@ interactive_wifi_connect_if_offline() {
   if is_online; then
     say "Network appears online; skipping Wi-Fi prompt."
     ensure_wifi_autoconnect
-    return 0
-  fi
-
-  if nmcli -t -f TYPE,STATE dev status 2>/dev/null | grep -q '^ethernet:connected'; then
-    say "Ethernet connected but DNS/IP check failed; continuing without Wi-Fi prompt."
     return 0
   fi
 
@@ -236,16 +239,15 @@ enable_services() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
     run_sudo systemctl enable --now docker >/dev/null 2>&1 || true
     if getent group docker >/dev/null 2>&1; then
-      if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-        say "Adding user '$USER' to docker group (logout/login required)"
-        run_sudo usermod -aG docker "$USER" || true
+      if ! id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx docker; then
+        say "Adding user '$TARGET_USER' to docker group (logout/login required)"
+        run_sudo usermod -aG docker "$TARGET_USER" || true
       fi
     fi
   fi
 }
 
 setup_bluez_autenable() {
-  # Non-destructive: drop-in rather than overwriting /etc/bluetooth/main.conf
   say "Configuring BlueZ AutoEnable (drop-in)"
   run_sudo mkdir -p /etc/bluetooth/main.conf.d
   run_sudo tee /etc/bluetooth/main.conf.d/10-cortado.conf >/dev/null <<'EOF'
@@ -256,13 +258,14 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Configs
+# USER CONFIGS (always written to TARGET_HOME as TARGET_USER)
 # ------------------------------------------------------------------------------
+user_mkdir() { as_user "mkdir -p '$1'"; }
+
 setup_fuzzel_config() {
-  local dir="${HOME}/.config/fuzzel" cfg="${dir}/fuzzel.ini"
-  mkdir -p "$dir"
-  [[ -f "$cfg" ]] && { say "Fuzzel config exists (skip)"; return 0; }
-  cat >"$cfg" <<'EOF'
+  local dir="${TARGET_HOME}/.config/fuzzel" cfg="${dir}/fuzzel.ini"
+  user_mkdir "$dir"
+  as_user "[[ -f '$cfg' ]] && echo 'skip fuzzel (exists)' || cat > '$cfg' <<'EOF'
 [main]
 terminal=alacritty -e
 prompt=>
@@ -272,176 +275,169 @@ fields=name,generic,comment,categories,filename,keywords
 [border]
 width=2
 radius=8
-EOF
+EOF"
 }
 
 setup_waybar_config() {
-  local dir="${HOME}/.config/waybar"
+  local dir="${TARGET_HOME}/.config/waybar"
   local cfg="${dir}/config.jsonc"
   local css="${dir}/style.css"
   local force="${FORCE_WAYBAR:-0}"
-  mkdir -p "$dir"
+  user_mkdir "$dir"
 
   if [[ -f "$cfg" && "$force" == "1" ]]; then
-    cp -a "$cfg" "${cfg}.bak.$(date +%Y%m%d%H%M%S)"
+    as_user "cp -a '$cfg' '${cfg}.bak.$(date +%Y%m%d%H%M%S)'"
   fi
   if [[ -f "$css" && "$force" == "1" ]]; then
-    cp -a "$css" "${css}.bak.$(date +%Y%m%d%H%M%S)"
+    as_user "cp -a '$css' '${css}.bak.$(date +%Y%m%d%H%M%S)'"
   fi
 
   if [[ ! -f "$cfg" || "$force" == "1" ]]; then
     say "Writing Waybar config: $cfg"
-    cat >"$cfg" <<'EOF'
+    as_user "cat > '$cfg' <<'EOF'
 {
-  "layer": "top",
-  "position": "top",
-  "spacing": 8,
+  \"layer\": \"top\",
+  \"position\": \"top\",
+  \"spacing\": 8,
 
-  "modules-left": ["hyprland/workspaces", "hyprland/window"],
-  "modules-center": ["clock"],
-  "modules-right": ["pulseaudio", "network", "bluetooth", "tray"],
+  \"modules-left\": [\"hyprland/workspaces\", \"hyprland/window\"],
+  \"modules-center\": [\"clock\"],
+  \"modules-right\": [\"pulseaudio\", \"network\", \"bluetooth\", \"tray\"],
 
-  "clock": { "format": "{:%a %d %b  %H:%M}" },
+  \"clock\": { \"format\": \"{:%a %d %b  %H:%M}\" },
 
-  "pulseaudio": {
-    "format": "{icon} {volume}%",
-    "format-muted": "󰝟 muted",
-    "format-icons": { "default": ["󰕿", "󰖀", "󰕾"] },
-    "on-click": "pavucontrol"
+  \"pulseaudio\": {
+    \"format\": \"{icon} {volume}%\",
+    \"format-muted\": \"󰝟 muted\",
+    \"format-icons\": { \"default\": [\"󰕿\", \"󰖀\", \"󰕾\"] },
+    \"on-click\": \"pavucontrol\"
   },
 
-  "network": {
-    "format-wifi": "󰤨 {signalStrength}%",
-    "format-ethernet": "󰈀",
-    "format-disconnected": "󰤭",
-    "tooltip-format-wifi": "{essid} ({signalStrength}%)",
-    "tooltip-format-ethernet": "{ifname}",
-    "on-click": "nm-connection-editor"
+  \"network\": {
+    \"format-wifi\": \"󰤨 {signalStrength}%\",
+    \"format-ethernet\": \"󰈀\",
+    \"format-disconnected\": \"󰤭\",
+    \"tooltip-format-wifi\": \"{essid} ({signalStrength}%)\",
+    \"tooltip-format-ethernet\": \"{ifname}\",
+    \"on-click\": \"nm-connection-editor\"
   },
 
-  "bluetooth": {
-    "format-on": "",
-    "format-off": "",
-    "format-disabled": "",
-    "tooltip-format": "{status}",
-    "on-click": "blueman-manager"
+  \"bluetooth\": {
+    \"format-on\": \"\",
+    \"format-off\": \"\",
+    \"format-disabled\": \"\",
+    \"tooltip-format\": \"{status}\",
+    \"on-click\": \"blueman-manager\"
   }
 }
-EOF
-  else
-    say "Waybar config exists: $cfg (skipping). Set FORCE_WAYBAR=1 to replace."
+EOF"
   fi
 
   if [[ ! -f "$css" || "$force" == "1" ]]; then
     say "Writing Waybar style: $css"
-    cat >"$css" <<'EOF'
-* { font-family: "Hack Nerd Font", "Hack", monospace; font-size: 12px; }
+    as_user "cat > '$css' <<'EOF'
+* { font-family: \"Hack Nerd Font\", \"Hack\", monospace; font-size: 12px; }
 window#waybar { background: rgba(20, 20, 20, 0.85); color: #e6e6e6; }
 #workspaces button { padding: 0 8px; margin: 4px 2px; border-radius: 8px; }
 #pulseaudio, #network, #bluetooth, #tray, #clock {
   padding: 0 10px; margin: 4px 0; border-radius: 8px;
   background: rgba(255, 255, 255, 0.06);
 }
-EOF
-  else
-    say "Waybar style exists: $css (skipping). Set FORCE_WAYBAR=1 to replace."
+EOF"
   fi
 }
 
 setup_lazyvim() {
-  mkdir -p "${HOME}/.config"
-  local nvim_dir="${HOME}/.config/nvim"
-  git_clone_retry "https://github.com/LazyVim/starter.git" "$nvim_dir" 1
-  [[ "${DETACH_LAZYVIM:-1}" == "1" && -d "$nvim_dir/.git" ]] && rm -rf "$nvim_dir/.git"
+  as_user "mkdir -p '${TARGET_HOME}/.config'"
+  local nvim_dir="${TARGET_HOME}/.config/nvim"
+  # clone must run as user to avoid root-owned files
+  as_user "python - <<'PY' 2>/dev/null || true
+PY"
+  as_user "command -v git >/dev/null 2>&1 || exit 0"
+  as_user "if [[ -d '$nvim_dir/.git' ]]; then exit 0; fi"
+  as_user "git clone --depth 1 https://github.com/LazyVim/starter.git '$nvim_dir' || true"
+  if [[ "${DETACH_LAZYVIM:-1}" == "1" ]]; then
+    as_user "rm -rf '$nvim_dir/.git' 2>/dev/null || true"
+  fi
 }
 
 set_default_browser_chromium() {
-  command -v xdg-settings >/dev/null 2>&1 && xdg-settings set default-web-browser chromium.desktop >/dev/null 2>&1 || true
-  command -v xdg-mime >/dev/null 2>&1 && {
+  as_user "command -v xdg-settings >/dev/null 2>&1 && xdg-settings set default-web-browser chromium.desktop >/dev/null 2>&1 || true"
+  as_user "command -v xdg-mime >/dev/null 2>&1 && {
     xdg-mime default chromium.desktop x-scheme-handler/http >/dev/null 2>&1 || true
     xdg-mime default chromium.desktop x-scheme-handler/https >/dev/null 2>&1 || true
-  }
+  }"
 }
 
-# ------------------------------------------------------------------------------
-# Hyprland startup fix (no display manager) + optional autologin
-# ------------------------------------------------------------------------------
 setup_hyprland_startup() {
-  [[ "${ENABLE_AUTOHYPR:-1}" == "1" ]] || { say "Hyprland autostart disabled (ENABLE_AUTOHYPR!=1)."; return 0; }
-  local profile="${HOME}/.bash_profile"
+  [[ "${ENABLE_AUTOHYPR:-1}" == "1" ]] || { say "Hyprland autostart disabled."; return 0; }
+  local profile="${TARGET_HOME}/.bash_profile"
   local marker="# >>> cortado hyprland autostart >>>"
-  [[ -f "$profile" && "$(grep -cF "$marker" "$profile" || true)" -gt 0 ]] && { say "Hyprland autostart already set (skip)"; return 0; }
 
-  say "Adding Hyprland start via dbus-run-session to ~/.bash_profile"
-  cat >>"$profile" <<'EOF'
+  # ensure file exists
+  as_user "touch '$profile'"
+
+  # add once
+  if as_user "grep -qF '$marker' '$profile'"; then
+    say "Hyprland autostart already present (skip)."
+    return 0
+  fi
+
+  say "Adding Hyprland autostart to: $profile"
+  as_user "cat >> '$profile' <<'EOF'
 
 # >>> cortado hyprland autostart >>>
-# Start Hyprland on TTY1 only, under a D-Bus session (recommended)
-if [[ -z "$WAYLAND_DISPLAY" && "${XDG_VTNR:-0}" -eq 1 ]]; then
+# Start Hyprland on TTY1 only, under a D-Bus session
+if [[ -z \"\$WAYLAND_DISPLAY\" && \"\${XDG_VTNR:-0}\" -eq 1 ]]; then
   exec dbus-run-session Hyprland
 fi
 # <<< cortado hyprland autostart <<<
-EOF
+EOF"
 }
 
 setup_tty_autologin() {
-  [[ "${ENABLE_AUTOLOGIN:-0}" == "1" ]] || { say "Auto-login disabled (ENABLE_AUTOLOGIN!=1)."; return 0; }
-  local user="${SUDO_USER:-$USER}"
-  [[ -n "${user:-}" ]] || die "Could not determine user for auto-login."
-  say "Enabling TTY1 auto-login for user: ${user}"
+  [[ "${ENABLE_AUTOLOGIN:-0}" == "1" ]] || { say "Auto-login disabled."; return 0; }
+  say "Enabling TTY1 auto-login for user: ${TARGET_USER}"
   run_sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
   run_sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
 [Service]
 ExecStart=
-ExecStart=-/usr/bin/agetty --autologin ${user} --noclear %I \$TERM
+ExecStart=-/usr/bin/agetty --autologin ${TARGET_USER} --noclear %I \$TERM
 EOF
   run_sudo systemctl daemon-reexec
   run_sudo systemctl restart getty@tty1 >/dev/null 2>&1 || true
 }
 
-# ------------------------------------------------------------------------------
-# Hyprland config (bindings + monitor layout + blueman-applet autostart)
-# ------------------------------------------------------------------------------
 setup_hyprland_conf() {
-  local dir="${HOME}/.config/hypr"
+  local dir="${TARGET_HOME}/.config/hypr"
   local conf="${dir}/hyprland.conf"
   local force="${FORCE_HYPR_CONF:-0}"
-  mkdir -p "$dir"
+  user_mkdir "$dir"
 
   if [[ -f "$conf" && "$force" != "1" ]]; then
-    say "Hyprland config exists: $conf (skipping). Set FORCE_HYPR_CONF=1 to backup+replace."
+    say "Hyprland config exists (skip): $conf"
     return 0
   fi
 
   if [[ -f "$conf" && "$force" == "1" ]]; then
-    local backup="${conf}.bak.$(date +%Y%m%d%H%M%S)"
-    say "Backing up existing Hyprland config to: $backup"
-    cp -a "$conf" "$backup"
+    as_user "cp -a '$conf' '${conf}.bak.$(date +%Y%m%d%H%M%S)'"
   fi
 
   say "Writing Hyprland config: $conf"
-  cat >"$conf" <<'EOF'
-# Hyprland config generated by cortado.sh
-# Monitor layout (edit connector names after `hyprctl monitors` if needed):
-# - External ultrawide (DP-1) 3440x1440 at 0x0
-# - Laptop (eDP-1) to the right at 3440x0
-
+  as_user "cat > '$conf' <<'EOF'
 $mod = SUPER
 $term = alacritty
 $menu = fuzzel
 $browser = chromium
 
-# ---------- Monitors ----------
+# Monitors (may need editing after first start)
 monitor=DP-1,3440x1440@60,0x0,1
 monitor=eDP-1,preferred,3440x0,1
 
-# ---------- Input ----------
 input {
   kb_layout = gb
   follow_mouse = 1
-  touchpad {
-    natural_scroll = true
-  }
+  touchpad { natural_scroll = true }
 }
 
 general {
@@ -451,25 +447,15 @@ general {
   layout = dwindle
 }
 
-decoration {
-  rounding = 10
-  blur { enabled = false }
-}
-
+decoration { rounding = 10  blur { enabled = false } }
 animations { enabled = false }
+misc { disable_hyprland_logo = true  disable_splash_rendering = true }
 
-misc {
-  disable_hyprland_logo = true
-  disable_splash_rendering = true
-}
-
-# ---------- Autostart ----------
 exec-once = waybar
 exec-once = mako
 exec-once = blueman-applet
 exec-once = /usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1
 
-# ---------- Keybindings ----------
 bind = $mod, RETURN, exec, $term
 bind = $mod, D, exec, $menu
 bind = $mod, B, exec, $browser
@@ -480,31 +466,23 @@ bind = $mod SHIFT, Q, exit
 bind = $mod, F, fullscreen
 bind = $mod, SPACE, togglefloating
 bind = $mod, P, pseudo
-bind = $mod, J, togglesplit
+bind = $mod, T, togglesplit
 
-# Focus movement (vim + arrows)
 bind = $mod, H, movefocus, l
 bind = $mod, L, movefocus, r
 bind = $mod, K, movefocus, u
 bind = $mod, J, movefocus, d
-bind = $mod, left, movefocus, l
-bind = $mod, right, movefocus, r
-bind = $mod, up, movefocus, u
-bind = $mod, down, movefocus, d
 
-# Move windows
 bind = $mod SHIFT, H, movewindow, l
 bind = $mod SHIFT, L, movewindow, r
 bind = $mod SHIFT, K, movewindow, u
 bind = $mod SHIFT, J, movewindow, d
 
-# Resize (hold CTRL)
 bind = $mod CTRL, H, resizeactive, -40 0
 bind = $mod CTRL, L, resizeactive, 40 0
 bind = $mod CTRL, K, resizeactive, 0 -40
 bind = $mod CTRL, J, resizeactive, 0 40
 
-# Workspaces 1-9
 bind = $mod, 1, workspace, 1
 bind = $mod, 2, workspace, 2
 bind = $mod, 3, workspace, 3
@@ -515,7 +493,6 @@ bind = $mod, 7, workspace, 7
 bind = $mod, 8, workspace, 8
 bind = $mod, 9, workspace, 9
 
-# Move active window to workspace 1-9
 bind = $mod SHIFT, 1, movetoworkspace, 1
 bind = $mod SHIFT, 2, movetoworkspace, 2
 bind = $mod SHIFT, 3, movetoworkspace, 3
@@ -526,10 +503,9 @@ bind = $mod SHIFT, 7, movetoworkspace, 7
 bind = $mod SHIFT, 8, movetoworkspace, 8
 bind = $mod SHIFT, 9, movetoworkspace, 9
 
-# Mouse: move/resize windows with mod
 bindm = $mod, mouse:272, movewindow
 bindm = $mod, mouse:273, resizewindow
-EOF
+EOF"
 }
 
 # ------------------------------------------------------------------------------
@@ -540,11 +516,13 @@ main() {
   need_cmd systemctl
   need_cmd getent
 
+  say "Target user: $TARGET_USER"
+  say "Target home: $TARGET_HOME"
+
   ensure_network_services
   interactive_wifi_connect_if_offline
 
   [[ "${FORCE_NM_DNS:-0}" == "1" ]] && force_nm_dns || true
-
   wait_for_dns github.com 30 || { force_nm_dns; wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."; }
   wait_for_dns raw.githubusercontent.com 30 || { force_nm_dns; wait_for_dns raw.githubusercontent.com 60 || die "DNS not working; connect to network and retry."; }
   wait_for_http "https://github.com" 10 || say "Warning: HTTPS check failed; continuing."
@@ -566,23 +544,20 @@ main() {
 
   enable_services
   ensure_wifi_autoconnect
-
-  # Bluetooth pairing-stick fixes (all three)
   setup_bluez_autenable
 
+  # user configs (now guaranteed to land in the right home)
   setup_fuzzel_config
   setup_waybar_config
   setup_lazyvim
   set_default_browser_chromium
-
-  setup_hyprland_startup
-  setup_tty_autologin
   setup_hyprland_conf
+  setup_hyprland_startup
+
+  # optional system tweak
+  setup_tty_autologin
 
   say "Complete."
-  say "Bluetooth fixes applied: AutoEnable=true drop-in + bluetooth enabled + blueman-applet autostart (if Hypr config written)."
-  say "If you want Hypr config overwritten on existing systems: FORCE_HYPR_CONF=1"
-  say "If you want Waybar config overwritten on existing systems: FORCE_WAYBAR=1"
 }
 
 main "$@"
