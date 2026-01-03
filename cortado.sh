@@ -3,9 +3,12 @@ set -euo pipefail
 
 # ==============================================================================
 # cortado.sh — Arch bootstrap (repo-only, no AUR, no Flatpak)
-# Single-script, but correctly handles:
-#  - root tasks via sudo
-#  - user config tasks written to the *real* user home, even if invoked with sudo
+# Works when run as: curl -fsSL https://.../cortado.sh | bash
+#
+# Key properties:
+# - System tasks run via sudo
+# - User configs ALWAYS target the real login user (SUDO_USER if present)
+# - No reliance on local repo files
 #
 # Controls (env vars):
 #   ENABLE_AUTOLOGIN=1    # enable auto-login on tty1 for target user (default: 0)
@@ -21,21 +24,44 @@ say() { printf '%s %s\n' "$LOG_PREFIX" "$*"; }
 die() { printf '%s ERROR: %s\n' "$LOG_PREFIX" "$*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
 
-run_sudo() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then sudo "$@"; else "$@"; fi; }
+# --- sudo that works with curl|bash (stdin not a tty) ---
+sudo_preflight() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    [[ -e /dev/tty ]] || die "Need sudo password but no /dev/tty (running non-interactive)."
+    sudo -v </dev/tty || die "sudo auth failed"
+  else
+    sudo -v || die "sudo auth failed"
+  fi
+}
 
-# --- determine real target user/home (critical fix) ---
+run_sudo() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    if [[ ! -t 0 ]]; then
+      sudo "$@" </dev/tty
+    else
+      sudo "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
+# --- determine target user/home (critical for user configs) ---
 TARGET_USER="${SUDO_USER:-${USER:-}}"
 [[ -n "${TARGET_USER:-}" ]] || die "Could not determine target user."
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -n "${TARGET_HOME:-}" && -d "$TARGET_HOME" ]] || die "Could not determine home for user '$TARGET_USER'."
 
 as_user() {
-  # run command as target user with correct HOME
+  # Run under target user, with correct HOME, even if script is root.
+  local cmd="$1"
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    run_sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$*"
+    run_sudo -u "$TARGET_USER" env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$cmd"
   else
-    # already user; still enforce HOME/USER for safety
-    env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$*"
+    env HOME="$TARGET_HOME" USER="$TARGET_USER" bash -lc "$cmd"
   fi
 }
 
@@ -54,7 +80,7 @@ require_pacman_system() {
 }
 
 # ------------------------------------------------------------------------------
-# Network / DNS preflight
+# Network / DNS
 # ------------------------------------------------------------------------------
 ensure_network_services() {
   say "Ensuring network services are available..."
@@ -68,6 +94,8 @@ ensure_network_services() {
     fi
   fi
 }
+
+is_online() { ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && getent ahosts github.com >/dev/null 2>&1; }
 
 force_nm_dns() {
   command -v nmcli >/dev/null 2>&1 || return 0
@@ -87,52 +115,14 @@ wait_for_dns() {
     getent ahosts "$host" >/dev/null 2>&1 && { say "DNS OK: ${host}"; return 0; }
     sleep 1
   done
-  say "DNS failed for ${host}. Debug:"
-  command -v resolvectl >/dev/null 2>&1 && resolvectl status || true
-  cat /etc/resolv.conf || true
   return 1
-}
-
-wait_for_http() {
-  local url="${1:-https://github.com}" tries="${2:-20}"
-  command -v curl >/dev/null 2>&1 || return 0
-  say "Checking HTTPS reachability: ${url} (up to ${tries}s)"
-  for ((i=1; i<=tries; i++)); do
-    curl -fsSL --max-time 5 "$url" >/dev/null 2>&1 && { say "HTTPS OK."; return 0; }
-    sleep 1
-  done
-  return 1
-}
-
-is_online() { ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && getent ahosts github.com >/dev/null 2>&1; }
-
-ensure_wifi_autoconnect() {
-  command -v nmcli >/dev/null 2>&1 || return 0
-  run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
-
-  local active_wifi_con
-  active_wifi_con="$(nmcli -t -f NAME,TYPE con show --active 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}')"
-  if [[ -n "${active_wifi_con:-}" ]]; then
-    say "Setting autoconnect for active Wi-Fi connection: ${active_wifi_con}"
-    nmcli connection modify "${active_wifi_con}" connection.autoconnect yes >/dev/null 2>&1 || true
-    nmcli connection modify "${active_wifi_con}" connection.autoconnect-priority 10 >/dev/null 2>&1 || true
-  fi
-
-  local wifi_cons
-  wifi_cons="$(nmcli -t -f NAME,TYPE con show 2>/dev/null | awk -F: '$2=="wifi"{print $1}')"
-  if [[ -n "${wifi_cons:-}" ]]; then
-    while IFS= read -r c; do
-      [[ -n "$c" ]] && nmcli connection modify "$c" connection.autoconnect yes >/dev/null 2>&1 || true
-    done <<<"$wifi_cons"
-    say "Ensured autoconnect=yes for saved Wi-Fi profiles."
-  fi
 }
 
 interactive_wifi_connect_if_offline() {
   command -v nmcli >/dev/null 2>&1 || return 0
+
   if is_online; then
-    say "Network appears online; skipping Wi-Fi prompt."
-    ensure_wifi_autoconnect
+    say "Online; skipping Wi-Fi prompt."
     return 0
   fi
 
@@ -143,14 +133,15 @@ interactive_wifi_connect_if_offline() {
   command -v rfkill >/dev/null 2>&1 && run_sudo rfkill unblock wifi >/dev/null 2>&1 || true
   nmcli radio wifi on >/dev/null 2>&1 || true
 
-  say "Offline detected. Starting interactive Wi-Fi setup (device: ${wifi_dev})."
+  say "Offline detected. Interactive Wi-Fi (device: ${wifi_dev})."
   nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true
 
   local attempts=0 max_attempts=3
   while (( attempts < max_attempts )); do
     attempts=$((attempts+1))
+
     local ssid sec km psk
-    read -r -p "Enter SSID (Wi-Fi name). Leave empty to re-list: " ssid
+    read -r -p "SSID (empty to re-list): " ssid
     if [[ -z "${ssid}" ]]; then
       nmcli -f SSID,SECURITY,SIGNAL dev wifi list ifname "${wifi_dev}" || true
       continue
@@ -160,30 +151,23 @@ interactive_wifi_connect_if_offline() {
     sec="${sec:-unknown}"
 
     if [[ "${sec}" == "--" || "${sec}" == "NONE" ]]; then
-      say "Open network. Connecting..."
-      nmcli dev wifi connect "${ssid}" ifname "${wifi_dev}" && break || { say "Connect failed."; continue; }
+      nmcli dev wifi connect "${ssid}" ifname "${wifi_dev}" && break || continue
     fi
 
     echo "${sec}" | grep -qi 'WPA3' && km="sae" || km="wpa-psk"
-    read -r -s -p "Enter Wi-Fi password for '${ssid}': " psk; echo ""
-    say "Connecting to '${ssid}' (key-mgmt: ${km})..."
-    nmcli dev wifi connect "${ssid}" password "${psk}" ifname "${wifi_dev}" -- 802-11-wireless-security.key-mgmt "${km}" && break
-    say "Connect failed (attempt ${attempts}/${max_attempts})."
+    read -r -s -p "Password for '${ssid}': " psk; echo ""
+    nmcli dev wifi connect "${ssid}" password "${psk}" ifname "${wifi_dev}" -- 802-11-wireless-security.key-mgmt "${km}" && break || true
   done
 
-  ensure_wifi_autoconnect
-  is_online && { say "Online confirmed."; return 0; }
-
-  if [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
+  if ! is_online && [[ "${FORCE_NM_DNS:-0}" == "1" ]]; then
     force_nm_dns
-    is_online && { say "Online confirmed after DNS override."; return 0; }
   fi
 
-  die "Still offline after Wi-Fi attempts. Connect to a network, then rerun this script."
+  is_online || die "Still offline. Connect to a network, then rerun."
 }
 
 # ------------------------------------------------------------------------------
-# Pacman
+# Pacman helpers
 # ------------------------------------------------------------------------------
 pacman_bootstrap() {
   say "Refreshing keyring + syncing databases…"
@@ -196,22 +180,6 @@ pacman_install_best_effort() {
   for p in "$@"; do pacman -Si "$p" >/dev/null 2>&1 && ok+=("$p") || missing+=("$p"); done
   ((${#missing[@]})) && say "Skipping missing: ${missing[*]}"
   ((${#ok[@]})) && run_sudo pacman -S --noconfirm --needed "${ok[@]}" || true
-}
-
-git_clone_retry() {
-  local repo="$1" dest="$2" depth="${3:-1}" n=0 max=5
-  while true; do
-    [[ -d "$dest/.git" ]] && { say "Repo present: $dest (skip)"; return 0; }
-    if [[ -e "$dest" && ! -d "$dest/.git" ]]; then
-      local backup="${dest}.bak.$(date +%Y%m%d%H%M%S)"
-      say "Destination exists (non-git). Moving to: $backup"
-      mv "$dest" "$backup"
-    fi
-    say "Cloning: $repo -> $dest"
-    git clone --depth "$depth" "$repo" "$dest" && return 0
-    n=$((n+1)); [[ "$n" -ge "$max" ]] && die "Failed to clone after ${max} attempts: $repo"
-    sleep $((n*2))
-  done
 }
 
 # ------------------------------------------------------------------------------
@@ -232,7 +200,7 @@ define_packages() {
 # Services and Bluetooth fixes
 # ------------------------------------------------------------------------------
 enable_services() {
-  say "Enabling core services…"
+  say "Enabling services…"
   run_sudo systemctl enable --now NetworkManager >/dev/null 2>&1 || true
   run_sudo systemctl enable --now bluetooth >/dev/null 2>&1 || true
 
@@ -240,7 +208,6 @@ enable_services() {
     run_sudo systemctl enable --now docker >/dev/null 2>&1 || true
     if getent group docker >/dev/null 2>&1; then
       if ! id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx docker; then
-        say "Adding user '$TARGET_USER' to docker group (logout/login required)"
         run_sudo usermod -aG docker "$TARGET_USER" || true
       fi
     fi
@@ -258,14 +225,15 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# USER CONFIGS (always written to TARGET_HOME as TARGET_USER)
+# User configs (always into TARGET_HOME)
 # ------------------------------------------------------------------------------
-user_mkdir() { as_user "mkdir -p '$1'"; }
-
 setup_fuzzel_config() {
-  local dir="${TARGET_HOME}/.config/fuzzel" cfg="${dir}/fuzzel.ini"
-  user_mkdir "$dir"
-  as_user "[[ -f '$cfg' ]] && echo 'skip fuzzel (exists)' || cat > '$cfg' <<'EOF'
+  local dir cfg
+  dir="${TARGET_HOME}/.config/fuzzel"
+  cfg="${dir}/fuzzel.ini"
+  as_user "mkdir -p '$dir'"
+  as_user "[[ -f '$cfg' ]] && exit 0
+cat > '$cfg' <<'EOF'
 [main]
 terminal=alacritty -e
 prompt=>
@@ -279,21 +247,23 @@ EOF"
 }
 
 setup_waybar_config() {
-  local dir="${TARGET_HOME}/.config/waybar"
-  local cfg="${dir}/config.jsonc"
-  local css="${dir}/style.css"
-  local force="${FORCE_WAYBAR:-0}"
-  user_mkdir "$dir"
+  local dir cfg css force ts
+  dir="${TARGET_HOME}/.config/waybar"
+  cfg="${dir}/config.jsonc"
+  css="${dir}/style.css"
+  force="${FORCE_WAYBAR:-0}"
+  ts="$(date +%Y%m%d%H%M%S)"
+
+  as_user "mkdir -p '$dir'"
 
   if [[ -f "$cfg" && "$force" == "1" ]]; then
-    as_user "cp -a '$cfg' '${cfg}.bak.$(date +%Y%m%d%H%M%S)'"
+    as_user "cp -a '$cfg' '${cfg}.bak.${ts}'"
   fi
   if [[ -f "$css" && "$force" == "1" ]]; then
-    as_user "cp -a '$css' '${css}.bak.$(date +%Y%m%d%H%M%S)'"
+    as_user "cp -a '$css' '${css}.bak.${ts}'"
   fi
 
   if [[ ! -f "$cfg" || "$force" == "1" ]]; then
-    say "Writing Waybar config: $cfg"
     as_user "cat > '$cfg' <<'EOF'
 {
   \"layer\": \"top\",
@@ -334,7 +304,6 @@ EOF"
   fi
 
   if [[ ! -f "$css" || "$force" == "1" ]]; then
-    say "Writing Waybar style: $css"
     as_user "cat > '$css' <<'EOF'
 * { font-family: \"Hack Nerd Font\", \"Hack\", monospace; font-size: 12px; }
 window#waybar { background: rgba(20, 20, 20, 0.85); color: #e6e6e6; }
@@ -348,89 +317,50 @@ EOF"
 }
 
 setup_lazyvim() {
-  as_user "mkdir -p '${TARGET_HOME}/.config'"
-  local nvim_dir="${TARGET_HOME}/.config/nvim"
-  # clone must run as user to avoid root-owned files
-  as_user "python - <<'PY' 2>/dev/null || true
-PY"
-  as_user "command -v git >/dev/null 2>&1 || exit 0"
-  as_user "if [[ -d '$nvim_dir/.git' ]]; then exit 0; fi"
-  as_user "git clone --depth 1 https://github.com/LazyVim/starter.git '$nvim_dir' || true"
-  if [[ "${DETACH_LAZYVIM:-1}" == "1" ]]; then
-    as_user "rm -rf '$nvim_dir/.git' 2>/dev/null || true"
-  fi
+  local nvim_dir
+  nvim_dir="${TARGET_HOME}/.config/nvim"
+  as_user "command -v git >/dev/null 2>&1 || exit 0
+mkdir -p '${TARGET_HOME}/.config'
+if [[ -d '${nvim_dir}/.git' || -d '${nvim_dir}' && -f '${nvim_dir}/lua/config/lazy.lua' ]]; then
+  exit 0
+fi
+git clone --depth 1 https://github.com/LazyVim/starter.git '${nvim_dir}' || true
+if [[ '${DETACH_LAZYVIM:-1}' == '1' ]]; then
+  rm -rf '${nvim_dir}/.git' 2>/dev/null || true
+fi"
 }
 
 set_default_browser_chromium() {
-  as_user "command -v xdg-settings >/dev/null 2>&1 && xdg-settings set default-web-browser chromium.desktop >/dev/null 2>&1 || true"
-  as_user "command -v xdg-mime >/dev/null 2>&1 && {
-    xdg-mime default chromium.desktop x-scheme-handler/http >/dev/null 2>&1 || true
-    xdg-mime default chromium.desktop x-scheme-handler/https >/dev/null 2>&1 || true
-  }"
-}
-
-setup_hyprland_startup() {
-  [[ "${ENABLE_AUTOHYPR:-1}" == "1" ]] || { say "Hyprland autostart disabled."; return 0; }
-  local profile="${TARGET_HOME}/.bash_profile"
-  local marker="# >>> cortado hyprland autostart >>>"
-
-  # ensure file exists
-  as_user "touch '$profile'"
-
-  # add once
-  if as_user "grep -qF '$marker' '$profile'"; then
-    say "Hyprland autostart already present (skip)."
-    return 0
-  fi
-
-  say "Adding Hyprland autostart to: $profile"
-  as_user "cat >> '$profile' <<'EOF'
-
-# >>> cortado hyprland autostart >>>
-# Start Hyprland on TTY1 only, under a D-Bus session
-if [[ -z \"\$WAYLAND_DISPLAY\" && \"\${XDG_VTNR:-0}\" -eq 1 ]]; then
-  exec dbus-run-session Hyprland
-fi
-# <<< cortado hyprland autostart <<<
-EOF"
-}
-
-setup_tty_autologin() {
-  [[ "${ENABLE_AUTOLOGIN:-0}" == "1" ]] || { say "Auto-login disabled."; return 0; }
-  say "Enabling TTY1 auto-login for user: ${TARGET_USER}"
-  run_sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
-  run_sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
-[Service]
-ExecStart=
-ExecStart=-/usr/bin/agetty --autologin ${TARGET_USER} --noclear %I \$TERM
-EOF
-  run_sudo systemctl daemon-reexec
-  run_sudo systemctl restart getty@tty1 >/dev/null 2>&1 || true
+  as_user "command -v xdg-settings >/dev/null 2>&1 && xdg-settings set default-web-browser chromium.desktop >/dev/null 2>&1 || true
+command -v xdg-mime >/dev/null 2>&1 && {
+  xdg-mime default chromium.desktop x-scheme-handler/http >/dev/null 2>&1 || true
+  xdg-mime default chromium.desktop x-scheme-handler/https >/dev/null 2>&1 || true
+}"
 }
 
 setup_hyprland_conf() {
-  local dir="${TARGET_HOME}/.config/hypr"
-  local conf="${dir}/hyprland.conf"
-  local force="${FORCE_HYPR_CONF:-0}"
-  user_mkdir "$dir"
+  local dir conf force ts
+  dir="${TARGET_HOME}/.config/hypr"
+  conf="${dir}/hyprland.conf"
+  force="${FORCE_HYPR_CONF:-0}"
+  ts="$(date +%Y%m%d%H%M%S)"
+
+  as_user "mkdir -p '$dir'"
 
   if [[ -f "$conf" && "$force" != "1" ]]; then
-    say "Hyprland config exists (skip): $conf"
     return 0
   fi
-
   if [[ -f "$conf" && "$force" == "1" ]]; then
-    as_user "cp -a '$conf' '${conf}.bak.$(date +%Y%m%d%H%M%S)'"
+    as_user "cp -a '$conf' '${conf}.bak.${ts}'"
   fi
 
-  say "Writing Hyprland config: $conf"
   as_user "cat > '$conf' <<'EOF'
 $mod = SUPER
 $term = alacritty
 $menu = fuzzel
 $browser = chromium
 
-# Monitors (may need editing after first start)
+# Monitors (edit after `hyprctl monitors` if connector names differ)
 monitor=DP-1,3440x1440@60,0x0,1
 monitor=eDP-1,preferred,3440x0,1
 
@@ -440,13 +370,7 @@ input {
   touchpad { natural_scroll = true }
 }
 
-general {
-  gaps_in = 6
-  gaps_out = 10
-  border_size = 2
-  layout = dwindle
-}
-
+general { gaps_in = 6  gaps_out = 10  border_size = 2  layout = dwindle }
 decoration { rounding = 10  blur { enabled = false } }
 animations { enabled = false }
 misc { disable_hyprland_logo = true  disable_splash_rendering = true }
@@ -478,34 +402,47 @@ bind = $mod SHIFT, L, movewindow, r
 bind = $mod SHIFT, K, movewindow, u
 bind = $mod SHIFT, J, movewindow, d
 
-bind = $mod CTRL, H, resizeactive, -40 0
-bind = $mod CTRL, L, resizeactive, 40 0
-bind = $mod CTRL, K, resizeactive, 0 -40
-bind = $mod CTRL, J, resizeactive, 0 40
-
-bind = $mod, 1, workspace, 1
-bind = $mod, 2, workspace, 2
-bind = $mod, 3, workspace, 3
-bind = $mod, 4, workspace, 4
-bind = $mod, 5, workspace, 5
-bind = $mod, 6, workspace, 6
-bind = $mod, 7, workspace, 7
-bind = $mod, 8, workspace, 8
-bind = $mod, 9, workspace, 9
-
-bind = $mod SHIFT, 1, movetoworkspace, 1
-bind = $mod SHIFT, 2, movetoworkspace, 2
-bind = $mod SHIFT, 3, movetoworkspace, 3
-bind = $mod SHIFT, 4, movetoworkspace, 4
-bind = $mod SHIFT, 5, movetoworkspace, 5
-bind = $mod SHIFT, 6, movetoworkspace, 6
-bind = $mod SHIFT, 7, movetoworkspace, 7
-bind = $mod SHIFT, 8, movetoworkspace, 8
-bind = $mod SHIFT, 9, movetoworkspace, 9
-
 bindm = $mod, mouse:272, movewindow
 bindm = $mod, mouse:273, resizewindow
 EOF"
+}
+
+setup_hyprland_startup() {
+  [[ "${ENABLE_AUTOHYPR:-1}" == "1" ]] || return 0
+
+  local profile marker start_cmd
+  profile="${TARGET_HOME}/.bash_profile"
+  marker="# >>> cortado hyprland autostart >>>"
+
+  # Prefer start-hyprland to avoid the warning; fallback if missing.
+  if command -v start-hyprland >/dev/null 2>&1; then
+    start_cmd="exec start-hyprland"
+  else
+    start_cmd="exec dbus-run-session Hyprland"
+  fi
+
+  as_user "touch '$profile'"
+  as_user "grep -qF '$marker' '$profile' && exit 0
+cat >> '$profile' <<'EOF'
+
+# >>> cortado hyprland autostart >>>
+if [[ -z \"\$WAYLAND_DISPLAY\" && \"\${XDG_VTNR:-0}\" -eq 1 ]]; then
+  ${start_cmd}
+fi
+# <<< cortado hyprland autostart <<<
+EOF"
+}
+
+setup_tty_autologin() {
+  [[ "${ENABLE_AUTOLOGIN:-0}" == "1" ]] || return 0
+  run_sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+  run_sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=-/usr/bin/agetty --autologin ${TARGET_USER} --noclear %I \$TERM
+EOF
+  run_sudo systemctl daemon-reexec
+  run_sudo systemctl restart getty@tty1 >/dev/null 2>&1 || true
 }
 
 # ------------------------------------------------------------------------------
@@ -519,13 +456,15 @@ main() {
   say "Target user: $TARGET_USER"
   say "Target home: $TARGET_HOME"
 
+  sudo_preflight
+
   ensure_network_services
   interactive_wifi_connect_if_offline
 
-  [[ "${FORCE_NM_DNS:-0}" == "1" ]] && force_nm_dns || true
-  wait_for_dns github.com 30 || { force_nm_dns; wait_for_dns github.com 60 || die "DNS not working; connect to network and retry."; }
-  wait_for_dns raw.githubusercontent.com 30 || { force_nm_dns; wait_for_dns raw.githubusercontent.com 60 || die "DNS not working; connect to network and retry."; }
-  wait_for_http "https://github.com" 10 || say "Warning: HTTPS check failed; continuing."
+  if ! wait_for_dns github.com 20; then
+    [[ "${FORCE_NM_DNS:-0}" == "1" ]] && force_nm_dns
+    wait_for_dns github.com 40 || die "DNS still not working."
+  fi
 
   pacman_bootstrap
   define_packages
@@ -543,18 +482,14 @@ main() {
   pacman_install_best_effort "${DEVOPS_PKGS[@]}"
 
   enable_services
-  ensure_wifi_autoconnect
   setup_bluez_autenable
 
-  # user configs (now guaranteed to land in the right home)
   setup_fuzzel_config
   setup_waybar_config
   setup_lazyvim
   set_default_browser_chromium
   setup_hyprland_conf
   setup_hyprland_startup
-
-  # optional system tweak
   setup_tty_autologin
 
   say "Complete."
